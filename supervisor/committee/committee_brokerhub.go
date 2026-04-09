@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,12 @@ type simulation_param struct {
 	txsPerEpoch   int
 	currentEpoch  int
 	exchangeMode  string
+}
+
+type competitionDecisionState struct {
+	PendingTarget     string
+	PendingMode       string
+	ConsecutiveEpochs int
 }
 
 // CLPA committee operations
@@ -96,7 +103,9 @@ type BrokerhubCommitteeMod struct {
 	brokerhubEpochGrossRevenue map[string]*big.Float
 
 	// taxOptimizer map[string]*optimizer 替换为新的优化器
-	feeOptimizers map[string]optimizerPkg.FeeOptimizer
+	feeOptimizers          map[string]optimizerPkg.FeeOptimizer
+	brokerCompetitionState map[string]*competitionDecisionState
+	hubObservedFeeHistory  map[string][]float64
 
 	epochCrossTxSamples     []optimizerPkg.TransactionSample
 	epochCrossTxSamplesLock sync.Mutex
@@ -230,6 +239,8 @@ func NewBrokerhubCommitteeMod(Ip_nodeTable map[uint64]map[uint64]string, Ss *sig
 		brokerhubEpochProfit:       make(map[string]*big.Float),
 		brokerhubEpochGrossRevenue: make(map[string]*big.Float),
 		feeOptimizers:              make(map[string]optimizerPkg.FeeOptimizer),
+		brokerCompetitionState:     make(map[string]*competitionDecisionState),
+		hubObservedFeeHistory:      make(map[string][]float64),
 		epochCrossTxSamples:        make([]optimizerPkg.TransactionSample, 0),
 		feeOptimizerMode:           normalizedFeeOptimizerMode,
 		simSeed:                    simSeed,
@@ -658,6 +669,7 @@ func (bcm *BrokerhubCommitteeMod) calManagementExpanseRatio(epochTxSamples []opt
 			StrongestCompetitorEarn:  strongestCompetitorEarn,
 			Transactions:             epochTxSamples,
 		})
+		bcm.recordObservedHubFee(brokerhub_id, opt.FeeRate())
 		debugState := opt.DebugState()
 		if debugState.Mode == params.FeeOptimizerModePaperMonopoly {
 			shockTriggered := debugState.OptimizerPhase == "shock"
@@ -1171,23 +1183,7 @@ func (bcm *BrokerhubCommitteeMod) totalManagedBrokerFunds(hubID string) float64 
 }
 
 func (bcm *BrokerhubCommitteeMod) strongestCompetitorSnapshot(hubID string) (float64, float64) {
-	strongestCompetitorFunds := 0.0
-	strongestCompetitorEarn := 0.0
-	for _, competitorID := range bcm.BrokerHubAccountList {
-		if competitorID == hubID {
-			continue
-		}
-		competitorFunds := bcm.brokerFundsFloat64(competitorID)
-		if competitorFunds < strongestCompetitorFunds {
-			continue
-		}
-		strongestCompetitorFunds = competitorFunds
-		if profit, ok := bcm.brokerhubEpochProfit[competitorID]; ok && profit != nil {
-			strongestCompetitorEarn, _ = profit.Float64()
-		} else {
-			strongestCompetitorEarn = 0
-		}
-	}
+	_, strongestCompetitorFunds, strongestCompetitorEarn := bcm.strongestCompetitorDetails(hubID)
 	return strongestCompetitorFunds, strongestCompetitorEarn
 }
 
@@ -1316,8 +1312,143 @@ func clampFloat64(value, minValue, maxValue float64) float64 {
 	return value
 }
 
+const (
+	competitionPendingModeHub = "hub"
+	competitionPendingModeB2E = "b2e"
+
+	competitionPhaseCompetition = "competition"
+	competitionPhaseShock       = "shock"
+
+	competitionFeeHistoryWindow   = 4
+	competitionConfirmEpochs      = 2
+	competitionMarginScaleCap     = 0.25
+	competitionAttractionBoostCap = 1.35
+)
+
 func utilityTieTolerance(left, right float64) float64 {
 	return 1e-6
+}
+
+func (bcm *BrokerhubCommitteeMod) recordObservedHubFee(hubID string, feeRate float64) {
+	if bcm.hubObservedFeeHistory == nil {
+		bcm.hubObservedFeeHistory = make(map[string][]float64)
+	}
+	history := append(bcm.hubObservedFeeHistory[hubID], feeRate)
+	if len(history) > competitionFeeHistoryWindow {
+		history = append([]float64(nil), history[len(history)-competitionFeeHistoryWindow:]...)
+	}
+	bcm.hubObservedFeeHistory[hubID] = history
+}
+
+func (bcm *BrokerhubCommitteeMod) hubOptimizerPhase(hubID string) string {
+	opt := bcm.feeOptimizers[hubID]
+	if opt == nil {
+		return ""
+	}
+	return opt.DebugState().OptimizerPhase
+}
+
+func (bcm *BrokerhubCommitteeMod) strongestCompetitorDetails(hubID string) (string, float64, float64) {
+	strongestCompetitorID := ""
+	strongestCompetitorFunds := 0.0
+	strongestCompetitorEarn := 0.0
+	for _, competitorID := range bcm.BrokerHubAccountList {
+		if competitorID == hubID {
+			continue
+		}
+		competitorFunds := bcm.brokerFundsFloat64(competitorID)
+		if competitorFunds < strongestCompetitorFunds {
+			continue
+		}
+		strongestCompetitorID = competitorID
+		strongestCompetitorFunds = competitorFunds
+		if profit, ok := bcm.brokerhubEpochProfit[competitorID]; ok && profit != nil {
+			strongestCompetitorEarn, _ = profit.Float64()
+		} else {
+			strongestCompetitorEarn = 0
+		}
+	}
+	return strongestCompetitorID, strongestCompetitorFunds, strongestCompetitorEarn
+}
+
+func (bcm *BrokerhubCommitteeMod) strongestCompetitorFeeRate(hubID string, currentFeeRate float64) float64 {
+	competitorID, _, _ := bcm.strongestCompetitorDetails(hubID)
+	if competitorID == "" {
+		return currentFeeRate
+	}
+	opt := bcm.feeOptimizers[competitorID]
+	if opt == nil {
+		return currentFeeRate
+	}
+	return opt.FeeRate()
+}
+
+func (bcm *BrokerhubCommitteeMod) competitionSwitchScales() map[string]float64 {
+	type brokerRank struct {
+		id    string
+		funds float64
+	}
+
+	brokerRanks := make([]brokerRank, 0, len(bcm.Broker.BrokerAddress))
+	for _, brokerID := range bcm.Broker.BrokerAddress {
+		if slices.Contains(bcm.BrokerHubAccountList, brokerID) {
+			continue
+		}
+		brokerRanks = append(brokerRanks, brokerRank{
+			id:    brokerID,
+			funds: bcm.brokerFundsFloat64(brokerID),
+		})
+	}
+	sort.Slice(brokerRanks, func(i, j int) bool {
+		if math.Abs(brokerRanks[i].funds-brokerRanks[j].funds) <= 1e-9 {
+			return brokerRanks[i].id < brokerRanks[j].id
+		}
+		return brokerRanks[i].funds < brokerRanks[j].funds
+	})
+	switchScales := make(map[string]float64, len(brokerRanks))
+	if len(brokerRanks) == 0 {
+		return switchScales
+	}
+	for idx, rankedBroker := range brokerRanks {
+		normalizedRank := 0.0
+		if len(brokerRanks) > 1 {
+			normalizedRank = float64(idx) / float64(len(brokerRanks)-1)
+		}
+		switchScales[rankedBroker.id] = 1 + competitionMarginScaleCap*normalizedRank
+	}
+	return switchScales
+}
+
+func competitionMargins(bestHubUtility, currentHubUtility, switchScale float64) (float64, float64, float64) {
+	maxAbsUtility := math.Max(1.0, math.Max(math.Abs(bestHubUtility), math.Abs(currentHubUtility)))
+	joinMargin := math.Max(0.75, 0.05*maxAbsUtility)
+	switchMargin := math.Max(0.75, 0.05*maxAbsUtility)
+	exitMargin := math.Max(0.50, 0.03*maxAbsUtility)
+	return joinMargin * switchScale, switchMargin * switchScale, exitMargin * switchScale
+}
+
+func (bcm *BrokerhubCommitteeMod) clearCompetitionDecisionState(brokerID string) {
+	if bcm.brokerCompetitionState == nil {
+		return
+	}
+	delete(bcm.brokerCompetitionState, brokerID)
+}
+
+func (bcm *BrokerhubCommitteeMod) observeCompetitionDecision(brokerID, target, mode string) int {
+	if bcm.brokerCompetitionState == nil {
+		bcm.brokerCompetitionState = make(map[string]*competitionDecisionState)
+	}
+	state, ok := bcm.brokerCompetitionState[brokerID]
+	if !ok || state.PendingTarget != target || state.PendingMode != mode {
+		bcm.brokerCompetitionState[brokerID] = &competitionDecisionState{
+			PendingTarget:     target,
+			PendingMode:       mode,
+			ConsecutiveEpochs: 1,
+		}
+		return 1
+	}
+	state.ConsecutiveEpochs++
+	return state.ConsecutiveEpochs
 }
 
 func (bcm *BrokerhubCommitteeMod) estimateHubUtility(brokerID, brokerhubID string, directUtility float64) float64 {
@@ -1359,6 +1490,22 @@ func (bcm *BrokerhubCommitteeMod) estimateHubUtility(brokerID, brokerhubID strin
 	)
 	projectedBoost := clampFloat64(scaleBoost*rankBoost, 1.0, 1.8)
 	projectedGrossRevenue := projectedPoolFunds * baseRevenueRate * projectedBoost
+	if opt.DebugState().OptimizerPhase == competitionPhaseCompetition {
+		currentFeeRate := opt.FeeRate()
+		previousFeeRate := currentFeeRate
+		if history := bcm.hubObservedFeeHistory[brokerhubID]; len(history) >= 2 {
+			previousFeeRate = history[len(history)-2]
+		}
+		recentFeeCut := math.Max(0, previousFeeRate-currentFeeRate)
+		strongestCompetitorFee := bcm.strongestCompetitorFeeRate(brokerhubID, currentFeeRate)
+		feeGap := math.Max(0, strongestCompetitorFee-currentFeeRate)
+		competitionAttractionBoost := clampFloat64(
+			1+1.6*recentFeeCut+0.9*feeGap,
+			1.0,
+			competitionAttractionBoostCap,
+		)
+		projectedGrossRevenue *= competitionAttractionBoost
+	}
 	expectedPayout := (1 - opt.FeeRate()) * projectedBrokerShare * projectedGrossRevenue
 	return expectedPayout - directUtility
 }
@@ -1386,6 +1533,7 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 	bcm.calManagementExpanseRatio(epochTxSamples)
 	bcm.writeDataToCsv(false, len(epochTxSamples))
 	bcm.refreshDirectUtilityEstimates()
+	brokerSwitchScales := bcm.competitionSwitchScales()
 	broker_decision_map := make(map[string]string)
 	for _, broker_id := range bcm.Broker.BrokerAddress {
 		if slices.Contains(bcm.BrokerHubAccountList, broker_id) {
@@ -1419,19 +1567,86 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 				currentHubUtility = hubUtility
 			}
 		}
+		switchScale := brokerSwitchScales[broker_id]
+		if switchScale == 0 {
+			switchScale = 1
+		}
+		currentUtilityForMargin := 0.0
+		if !math.IsInf(currentHubUtility, 0) && !math.IsNaN(currentHubUtility) {
+			currentUtilityForMargin = currentHubUtility
+		}
+		joinMargin, switchMargin, exitMargin := competitionMargins(bestHubUtility, currentUtilityForMargin, switchScale)
 		switch {
-		case bestHubUtility <= 1e-6:
-			broker_decision_map[broker_id] = "b2e"
-		case bestHubTie:
+		case bestHubTie && (!broker_is_in_hub || bestHubUtility > 1e-6):
+			bcm.clearCompetitionDecisionState(broker_id)
 			if broker_is_in_hub {
 				broker_decision_map[broker_id] = broker_joined_hub_id
 			} else {
-				broker_decision_map[broker_id] = "b2e"
+				broker_decision_map[broker_id] = competitionPendingModeB2E
 			}
-		case broker_is_in_hub && math.Abs(bestHubUtility-currentHubUtility) <= utilityTieTolerance(bestHubUtility, currentHubUtility):
+		case broker_is_in_hub && bestHubUtility > 1e-6 && math.Abs(bestHubUtility-currentHubUtility) <= utilityTieTolerance(bestHubUtility, currentHubUtility):
+			bcm.clearCompetitionDecisionState(broker_id)
 			broker_decision_map[broker_id] = broker_joined_hub_id
+		case !broker_is_in_hub:
+			bestPhase := bcm.hubOptimizerPhase(bestHubID)
+			if bestHubUtility <= 1e-6 {
+				bcm.clearCompetitionDecisionState(broker_id)
+				broker_decision_map[broker_id] = competitionPendingModeB2E
+				continue
+			}
+			if bestPhase != competitionPhaseCompetition {
+				bcm.clearCompetitionDecisionState(broker_id)
+				broker_decision_map[broker_id] = bestHubID
+				continue
+			}
+			if bestHubUtility < joinMargin {
+				bcm.clearCompetitionDecisionState(broker_id)
+				broker_decision_map[broker_id] = competitionPendingModeB2E
+				continue
+			}
+			if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= competitionConfirmEpochs {
+				bcm.clearCompetitionDecisionState(broker_id)
+				broker_decision_map[broker_id] = bestHubID
+				continue
+			}
+			broker_decision_map[broker_id] = competitionPendingModeB2E
 		default:
-			broker_decision_map[broker_id] = bestHubID
+			currentPhase := bcm.hubOptimizerPhase(broker_joined_hub_id)
+			bestPhase := bcm.hubOptimizerPhase(bestHubID)
+			if currentPhase != competitionPhaseCompetition || bestPhase == competitionPhaseShock {
+				bcm.clearCompetitionDecisionState(broker_id)
+				if bestHubUtility <= 1e-6 {
+					broker_decision_map[broker_id] = competitionPendingModeB2E
+				} else {
+					broker_decision_map[broker_id] = bestHubID
+				}
+				continue
+			}
+			if bestHubID != "" && bestHubID != broker_joined_hub_id && bestPhase != competitionPhaseCompetition {
+				bcm.clearCompetitionDecisionState(broker_id)
+				broker_decision_map[broker_id] = bestHubID
+				continue
+			}
+			if bestHubID != "" && bestHubID != broker_joined_hub_id && bestHubUtility-currentHubUtility >= switchMargin {
+				if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= competitionConfirmEpochs {
+					bcm.clearCompetitionDecisionState(broker_id)
+					broker_decision_map[broker_id] = bestHubID
+					continue
+				}
+				broker_decision_map[broker_id] = broker_joined_hub_id
+				continue
+			}
+			if -currentHubUtility >= exitMargin {
+				if bcm.observeCompetitionDecision(broker_id, competitionPendingModeB2E, competitionPendingModeB2E) >= competitionConfirmEpochs {
+					bcm.clearCompetitionDecisionState(broker_id)
+					broker_decision_map[broker_id] = competitionPendingModeB2E
+					continue
+				}
+				broker_decision_map[broker_id] = broker_joined_hub_id
+				continue
+			}
+			bcm.clearCompetitionDecisionState(broker_id)
+			broker_decision_map[broker_id] = broker_joined_hub_id
 		}
 	}
 	bcm.BrokerBalanceLock.Unlock()

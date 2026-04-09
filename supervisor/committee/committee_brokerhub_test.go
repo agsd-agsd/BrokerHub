@@ -466,8 +466,10 @@ func newTestBrokerhubCommittee(brokerID string) *BrokerhubCommitteeMod {
 		feeOptimizers: map[string]optimizerPkg.FeeOptimizer{
 			hubID: optimizerPkg.NewTaxRateOptimizer(hubID, optimizerPkg.DefaultTaxOptimizerConfig(initialFundsFloat)),
 		},
-		feeOptimizerMode: params.FeeOptimizerModeTaxRate,
-		rng:              rand.New(rand.NewSource(1)),
+		brokerCompetitionState: make(map[string]*competitionDecisionState),
+		hubObservedFeeHistory:  make(map[string][]float64),
+		feeOptimizerMode:       params.FeeOptimizerModeTaxRate,
+		rng:                    rand.New(rand.NewSource(1)),
 		sl: &supervisor_log.SupervisorLog{
 			Slog: log.New(io.Discard, "", 0),
 		},
@@ -526,7 +528,7 @@ func TestCalManagementExpanseRatioPassesStrongestCompetitorMetrics(t *testing.T)
 	}
 }
 
-func TestBrokerBehaviourSimulatorUsesUtilityThresholdForJoinAndExit(t *testing.T) {
+func TestBrokerBehaviourSimulatorCompetitionJoinNeedsConfirmation(t *testing.T) {
 	brokerID := strings.Repeat("b", 40)
 	bcm := newTestBrokerhubCommittee(brokerID)
 	hubID := bcm.BrokerHubAccountList[0]
@@ -537,7 +539,7 @@ func TestBrokerBehaviourSimulatorUsesUtilityThresholdForJoinAndExit(t *testing.T
 			Mode:           params.FeeOptimizerModePaperMonopoly,
 			CurrentFeeRate: 0.1,
 			MinFeeRate:     0.001,
-			OptimizerPhase: "competition",
+			OptimizerPhase: competitionPhaseCompetition,
 		},
 	}
 	for shard := uint64(0); shard < uint64(params.ShardNum); shard++ {
@@ -548,27 +550,85 @@ func TestBrokerBehaviourSimulatorUsesUtilityThresholdForJoinAndExit(t *testing.T
 	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(120)
 	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(10)
 
-	oldWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
+	cleanup := prepareSimulationWorkspace(t)
+	defer cleanup()
+	bcm.writeDataToCsv(true, 0)
+
+	bcm.broker_behaviour_simulator(true)
+	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
+		t.Fatal("expected broker to stay in B2E until the competition signal is confirmed twice")
 	}
-	tempDir := t.TempDir()
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to switch working directory: %v", err)
-	}
-	defer func() {
-		_ = os.Chdir(oldWd)
-	}()
-	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
-		t.Fatalf("failed to create hubres directory: %v", err)
+	state := bcm.brokerCompetitionState[brokerID]
+	if state == nil || state.PendingTarget != hubID || state.PendingMode != competitionPendingModeHub || state.ConsecutiveEpochs != 1 {
+		t.Fatalf("expected pending join state after first epoch, got %#v", state)
 	}
 
+	bcm.hubParams.currentEpoch = 4
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(120)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(120)
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(10)
+	bcm.broker_behaviour_simulator(true)
+
+	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
+		t.Fatalf("expected broker to join hub %s after the second confirmation, got %q", hubID, joinedHub)
+	}
+}
+
+func TestBrokerBehaviourSimulatorCompetitionExitNeedsConfirmation(t *testing.T) {
+	brokerID := strings.Repeat("b", 40)
+	bcm := newTestBrokerhubCommittee(brokerID)
+	hubID := bcm.BrokerHubAccountList[0]
+	bcm.hubParams.currentEpoch = 3
+	bcm.feeOptimizers[hubID] = &staticFeeOptimizer{
+		fee: 0.85,
+		debug: optimizerPkg.FeeOptimizerDebug{
+			Mode:           params.FeeOptimizerModePaperMonopoly,
+			CurrentFeeRate: 0.85,
+			MinFeeRate:     0.001,
+			OptimizerPhase: competitionPhaseCompetition,
+		},
+	}
+	for shard := uint64(0); shard < uint64(params.ShardNum); shard++ {
+		bcm.Broker.BrokerBalance[hubID][shard] = big.NewInt(100)
+		bcm.Broker.BrokerBalance[brokerID][shard] = big.NewInt(100)
+	}
+	if res := bcm.JoiningToBrokerhub(brokerID, hubID); res != "done" {
+		t.Fatalf("expected initial join to succeed, got %q", res)
+	}
+	bcm.brokerB2EProfitHistory[brokerID] = []float64{25, 25, 25}
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(25)
+
+	cleanup := prepareSimulationWorkspace(t)
+	defer cleanup()
 	bcm.writeDataToCsv(true, 0)
+
 	bcm.broker_behaviour_simulator(true)
 	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
-		t.Fatalf("expected broker to join hub %s, got %q", hubID, joinedHub)
+		t.Fatalf("expected broker to remain in hub %s until a second negative epoch confirms exit, got %q", hubID, joinedHub)
+	}
+	state := bcm.brokerCompetitionState[brokerID]
+	if state == nil || state.PendingTarget != competitionPendingModeB2E || state.PendingMode != competitionPendingModeB2E || state.ConsecutiveEpochs != 1 {
+		t.Fatalf("expected pending B2E exit state after first epoch, got %#v", state)
 	}
 
+	bcm.hubParams.currentEpoch = 4
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(25)
+	bcm.broker_behaviour_simulator(true)
+
+	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
+		t.Fatal("expected broker to exit to B2E after two consecutive negative competition epochs")
+	}
+}
+
+func TestBrokerBehaviourSimulatorBypassesCompetitionHysteresisOutsideCompetition(t *testing.T) {
+	brokerID := strings.Repeat("b", 40)
+	bcm := newTestBrokerhubCommittee(brokerID)
+	hubID := bcm.BrokerHubAccountList[0]
+	bcm.hubParams.currentEpoch = 3
 	bcm.feeOptimizers[hubID] = &staticFeeOptimizer{
 		fee: 0.85,
 		debug: optimizerPkg.FeeOptimizerDebug{
@@ -578,77 +638,84 @@ func TestBrokerBehaviourSimulatorUsesUtilityThresholdForJoinAndExit(t *testing.T
 			OptimizerPhase: "memory",
 		},
 	}
+	for shard := uint64(0); shard < uint64(params.ShardNum); shard++ {
+		bcm.Broker.BrokerBalance[hubID][shard] = big.NewInt(100)
+		bcm.Broker.BrokerBalance[brokerID][shard] = big.NewInt(100)
+	}
+	if res := bcm.JoiningToBrokerhub(brokerID, hubID); res != "done" {
+		t.Fatalf("expected initial join to succeed, got %q", res)
+	}
+	bcm.brokerB2EProfitHistory[brokerID] = []float64{25, 25, 25}
 	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
 	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
 	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(25)
-	bcm.hubParams.currentEpoch = 4
+
+	cleanup := prepareSimulationWorkspace(t)
+	defer cleanup()
+	bcm.writeDataToCsv(true, 0)
 
 	bcm.broker_behaviour_simulator(true)
 	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
-		t.Fatalf("expected broker to exit hub after utility turns negative")
+		t.Fatal("expected negative utility in memory phase to exit immediately without competition hysteresis")
 	}
 }
 
-func TestBrokerBehaviourSimulatorAllowsMultipleMovesInOneEpoch(t *testing.T) {
-	brokerIDs := []string{
-		strings.Repeat("b", 40),
-		strings.Repeat("c", 40),
-		strings.Repeat("d", 40),
-		strings.Repeat("e", 40),
-	}
-	bcm := newTestBrokerhubCommittee(brokerIDs[0])
+func TestBrokerBehaviourSimulatorCompetitionLetsSmallerBrokersMoveFirst(t *testing.T) {
+	smallBrokerID := strings.Repeat("b", 40)
+	largeBrokerID := strings.Repeat("c", 40)
+	bcm := newTestBrokerhubCommittee(smallBrokerID)
 	hubID := bcm.BrokerHubAccountList[0]
-	bcm.hubParams.currentEpoch = 3
+	bcm.Broker.BrokerAddress = []utils.Address{smallBrokerID, largeBrokerID, hubID}
+	bcm.Broker.BrokerBalance[smallBrokerID] = shardBalances(10)
+	bcm.Broker.BrokerBalance[largeBrokerID] = shardBalances(20)
+	bcm.Broker.LockBalance[largeBrokerID] = shardBalances(0)
+	bcm.Broker.ProfitBalance[largeBrokerID] = shardProfitBalances()
+	for shard := uint64(0); shard < uint64(params.ShardNum); shard++ {
+		bcm.Broker.BrokerBalance[hubID][shard] = big.NewInt(100)
+	}
 	bcm.feeOptimizers[hubID] = &staticFeeOptimizer{
 		fee: 0.1,
 		debug: optimizerPkg.FeeOptimizerDebug{
 			Mode:           params.FeeOptimizerModePaperMonopoly,
 			CurrentFeeRate: 0.1,
 			MinFeeRate:     0.001,
-			OptimizerPhase: "competition",
+			OptimizerPhase: competitionPhaseCompetition,
 		},
 	}
+	bcm.hubParams.currentEpoch = 3
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(10)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(10)
+	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.8)
+	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(2.42)
 
-	bcm.Broker.BrokerAddress = append([]utils.Address{}, hubID)
-	for _, brokerID := range brokerIDs {
-		bcm.Broker.BrokerAddress = append(bcm.Broker.BrokerAddress, brokerID)
-		bcm.Broker.BrokerBalance[brokerID] = shardBalances(100)
-		bcm.Broker.LockBalance[brokerID] = shardBalances(0)
-		bcm.Broker.ProfitBalance[brokerID] = shardProfitBalances()
-		bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(0)
-	}
-	for shard := uint64(0); shard < uint64(params.ShardNum); shard++ {
-		bcm.Broker.BrokerBalance[hubID][shard] = big.NewInt(100)
-	}
-	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(160)
-	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(160)
-
-	oldWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	tempDir := t.TempDir()
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to switch working directory: %v", err)
-	}
-	defer func() {
-		_ = os.Chdir(oldWd)
-	}()
-	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
-		t.Fatalf("failed to create hubres directory: %v", err)
-	}
-
+	cleanup := prepareSimulationWorkspace(t)
+	defer cleanup()
 	bcm.writeDataToCsv(true, 0)
+
+	bcm.broker_behaviour_simulator(true)
+	if _, ok := bcm.brokerJoinBrokerHubState[smallBrokerID]; ok {
+		t.Fatal("expected smaller broker to wait for a second confirmation before joining")
+	}
+	if _, ok := bcm.brokerJoinBrokerHubState[largeBrokerID]; ok {
+		t.Fatal("expected larger broker to remain in B2E after the first epoch")
+	}
+
+	bcm.hubParams.currentEpoch = 4
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(10)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(10)
+	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.8)
+	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(2.42)
 	bcm.broker_behaviour_simulator(true)
 
-	for _, brokerID := range brokerIDs {
-		if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
-			t.Fatalf("expected broker %s to join hub %s, got %q", brokerID, hubID, joinedHub)
-		}
+	if joinedHub := bcm.brokerJoinBrokerHubState[smallBrokerID]; joinedHub != hubID {
+		t.Fatalf("expected smaller broker to join hub %s first, got %q", hubID, joinedHub)
+	}
+	if _, ok := bcm.brokerJoinBrokerHubState[largeBrokerID]; ok {
+		t.Fatal("expected larger broker to remain in B2E because its scaled join margin is higher")
 	}
 }
 
-func TestEstimateHubUtilityProjectsLowFeeChallengerUplift(t *testing.T) {
+func TestEstimateHubUtilityCompetitionFeeCutBoostsAttraction(t *testing.T) {
 	brokerID := strings.Repeat("b", 40)
 	incumbentHubID := strings.Repeat("a", 40)
 	challengerHubID := strings.Repeat("c", 40)
@@ -666,18 +733,28 @@ func TestEstimateHubUtilityProjectsLowFeeChallengerUplift(t *testing.T) {
 	bcm.brokerhubEpochGrossRevenue[incumbentHubID] = big.NewFloat(60)
 	bcm.brokerhubEpochGrossRevenue[challengerHubID] = big.NewFloat(30)
 	bcm.feeOptimizers = map[string]optimizerPkg.FeeOptimizer{
-		incumbentHubID:  &staticFeeOptimizer{fee: 0.45},
-		challengerHubID: &staticFeeOptimizer{fee: 0.05},
+		incumbentHubID: &staticFeeOptimizer{
+			fee: 0.05,
+			debug: optimizerPkg.FeeOptimizerDebug{
+				OptimizerPhase: competitionPhaseCompetition,
+			},
+		},
+		challengerHubID: &staticFeeOptimizer{
+			fee: 0.05,
+			debug: optimizerPkg.FeeOptimizerDebug{
+				OptimizerPhase: competitionPhaseCompetition,
+			},
+		},
 	}
+	bcm.hubObservedFeeHistory[incumbentHubID] = []float64{0.05, 0.05}
+	bcm.hubObservedFeeHistory[challengerHubID] = []float64{0.15, 0.05}
 
 	directUtility := 10.0
-	incumbentUtility := bcm.estimateHubUtility(brokerID, incumbentHubID, directUtility)
-	challengerUtility := bcm.estimateHubUtility(brokerID, challengerHubID, directUtility)
-	if challengerUtility <= 0 {
-		t.Fatalf("expected projected challenger utility to turn positive, got %.6f", challengerUtility)
-	}
-	if challengerUtility <= incumbentUtility {
-		t.Fatalf("expected challenger utility %.6f to exceed incumbent utility %.6f", challengerUtility, incumbentUtility)
+	boostedUtility := bcm.estimateHubUtility(brokerID, challengerHubID, directUtility)
+	bcm.hubObservedFeeHistory[challengerHubID] = []float64{0.05, 0.05}
+	baseUtility := bcm.estimateHubUtility(brokerID, challengerHubID, directUtility)
+	if boostedUtility <= baseUtility {
+		t.Fatalf("expected recent competition fee cut to raise utility, got boosted %.6f <= base %.6f", boostedUtility, baseUtility)
 	}
 }
 
@@ -687,6 +764,24 @@ func shardBalances(value int64) map[uint64]*big.Int {
 		result[shard] = big.NewInt(value)
 	}
 	return result
+}
+
+func prepareSimulationWorkspace(t *testing.T) func() {
+	t.Helper()
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to switch working directory: %v", err)
+	}
+	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
+		t.Fatalf("failed to create hubres directory: %v", err)
+	}
+	return func() {
+		_ = os.Chdir(oldWd)
+	}
 }
 
 func shardProfitBalances() map[uint64]*big.Float {

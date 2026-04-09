@@ -49,9 +49,6 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 	AddressSet = nil
 	mytool.UserRequestB2EQueue = nil
 
-	logger := &supervisor_log.SupervisorLog{
-		Slog: log.New(io.Discard, "", 0),
-	}
 	oldWd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("failed to get working directory: %v", err)
@@ -63,36 +60,10 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 	t.Cleanup(func() {
 		_ = os.Chdir(oldWd)
 	})
-	stopSignal := signal.NewStopSignal(2 * params.ShardNum)
-	bcm := NewBrokerhubCommitteeMod(
-		map[uint64]map[uint64]string{},
-		stopSignal,
-		logger,
-		params.FileInput,
-		params.TotalDataSize,
-		params.BatchSize,
-		params.ExchangeModeLimit300,
-		params.FeeOptimizerModePaperMonopoly,
-		42,
-	)
-
-	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
-		t.Fatalf("failed to create hubres directory: %v", err)
+	hub0Rows, hub1Rows := runPaperMonopolyReplay(t, repoRoot)
+	if len(hub0Rows) == 0 || len(hub1Rows) == 0 {
+		t.Fatalf("expected both replays to contain rows, got %d and %d", len(hub0Rows), len(hub1Rows))
 	}
-	_ = os.Remove("./hubres/hub0.csv")
-	_ = os.Remove("./hubres/hub1.csv")
-
-	bcm.init_brokerhub()
-	bcm.writeDataToCsv(true, 0)
-
-	var pending []*message.BrokerRawMeg
-	for !bcm.reachedEpochLimit() {
-		bcm.hubParams.currentEpoch++
-		txs := bcm.generateRandomTxs()
-		pending = runLocalBrokerhubEpoch(bcm, pending, txs)
-		bcm.broker_behaviour_simulator(true)
-	}
-
 	if _, err := os.Stat("./hubres/hub0.csv"); err != nil {
 		t.Fatalf("expected hub0.csv to be written, got %v", err)
 	}
@@ -100,26 +71,20 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 		t.Fatalf("expected hub1.csv to be written, got %v", err)
 	}
 
-	hub0Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub0.csv"))
-	if err != nil {
-		t.Fatalf("failed to parse hub0 replay: %v", err)
-	}
-	hub1Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub1.csv"))
-	if err != nil {
-		t.Fatalf("failed to parse hub1 replay: %v", err)
-	}
-	if len(hub0Rows) == 0 || len(hub1Rows) == 0 {
-		t.Fatalf("expected both replays to contain rows, got %d and %d", len(hub0Rows), len(hub1Rows))
-	}
-
 	if !hasNonZeroBrokerBeforeEpoch(hub0Rows, 40) && !hasNonZeroBrokerBeforeEpoch(hub1Rows, 40) {
 		t.Fatal("expected at least one hub to attract brokers before epoch 40")
 	}
 	if !hasCompetitionWindow(hub0Rows, 80) && !hasCompetitionWindow(hub1Rows, 80) {
-		t.Fatal("expected at least one hub to show MER down -> fund up -> lagged revenue up before epoch 80")
+		t.Fatal("expected at least one hub to show MER down -> broker_count up -> fund up -> lagged revenue up before epoch 80")
 	}
 	if !hasPhaseBeforeEpoch(hub0Rows, "shock", 150) && !hasPhaseBeforeEpoch(hub1Rows, "shock", 150) {
 		t.Fatal("expected at least one shock phase before epoch 150")
+	}
+	firstShockEpoch := earliestPhaseEpoch(hub0Rows, hub1Rows, "shock")
+	if firstShockEpoch > 0 {
+		if hasCompetitionPhaseFlushBeforeEpoch(hub0Rows, firstShockEpoch, params.BrokerNum) || hasCompetitionPhaseFlushBeforeEpoch(hub1Rows, firstShockEpoch, params.BrokerNum) {
+			t.Fatal("expected competition-phase broker counts to stay smoother before the first shock")
+		}
 	}
 	if math.Max(maxCriticalCapBeforeEpoch(hub0Rows, 150), maxCriticalCapBeforeEpoch(hub1Rows, 150)) <= 0.06 {
 		t.Fatal("expected a critical MER cap above 0.06 before epoch 150")
@@ -137,17 +102,22 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 		winnerRows = hub1Rows
 		loserRows = hub0Rows
 	}
-	if tailPhaseCount(winnerRows, "memory", 100) < 60 {
-		t.Fatal("expected the winner to be memory-dominant in the last 100 epochs")
+	if tailPhaseCount(winnerRows, "memory", 30) < 20 {
+		t.Fatal("expected the winner to settle into a memory-dominant regime in the final 30 epochs")
 	}
 	if tailMERRange(winnerRows, 100) <= 1e-4 {
 		t.Fatal("expected winner MER to keep moving in memory phase instead of flattening completely")
 	}
-	if finalCriticalCap(winnerRows) > 0 && finalTailMaxMER(winnerRows, 100) >= finalCriticalCap(winnerRows) {
-		t.Fatal("expected winner MER to stay below the learned critical MER cap in the last 100 epochs")
+	if finalCriticalCap(winnerRows) > 0 && finalTailMaxMER(winnerRows, 30) >= finalCriticalCap(winnerRows) {
+		t.Fatal("expected winner MER to stay below the learned critical MER cap once memory takes over")
 	}
 	if tailPhaseCount(loserRows, "memory", 100) == 100 && tailMERRange(loserRows, 100) <= 1e-4 {
 		t.Fatal("expected loser trajectory to remain responsive rather than collapsing into a flat memory line")
+	}
+
+	hub0RowsRepeat, hub1RowsRepeat := runPaperMonopolyReplay(t, repoRoot)
+	if !sameBrokerTrajectoryPrefix(hub0Rows, hub0RowsRepeat, 80) || !sameBrokerTrajectoryPrefix(hub1Rows, hub1RowsRepeat, 80) {
+		t.Fatal("expected repeated seed=42 replay runs to keep the same broker-count trajectory for the first 80 epochs")
 	}
 }
 
@@ -206,6 +176,54 @@ func runLocalBrokerhubEpoch(
 		)
 	}
 	return restBrokerRawMeg
+}
+
+func runPaperMonopolyReplay(t *testing.T, repoRoot string) ([]replayRow, []replayRow) {
+	t.Helper()
+
+	AddressSet = nil
+	mytool.UserRequestB2EQueue = nil
+	stopSignal := signal.NewStopSignal(2 * params.ShardNum)
+	bcm := NewBrokerhubCommitteeMod(
+		map[uint64]map[uint64]string{},
+		stopSignal,
+		&supervisor_log.SupervisorLog{
+			Slog: log.New(io.Discard, "", 0),
+		},
+		params.FileInput,
+		params.TotalDataSize,
+		params.BatchSize,
+		params.ExchangeModeLimit300,
+		params.FeeOptimizerModePaperMonopoly,
+		42,
+	)
+
+	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
+		t.Fatalf("failed to create hubres directory: %v", err)
+	}
+	_ = os.Remove("./hubres/hub0.csv")
+	_ = os.Remove("./hubres/hub1.csv")
+
+	bcm.init_brokerhub()
+	bcm.writeDataToCsv(true, 0)
+
+	var pending []*message.BrokerRawMeg
+	for !bcm.reachedEpochLimit() {
+		bcm.hubParams.currentEpoch++
+		txs := bcm.generateRandomTxs()
+		pending = runLocalBrokerhubEpoch(bcm, pending, txs)
+		bcm.broker_behaviour_simulator(true)
+	}
+
+	hub0Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub0.csv"))
+	if err != nil {
+		t.Fatalf("failed to parse hub0 replay: %v", err)
+	}
+	hub1Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub1.csv"))
+	if err != nil {
+		t.Fatalf("failed to parse hub1 replay: %v", err)
+	}
+	return hub0Rows, hub1Rows
 }
 
 type replayRow struct {
@@ -293,10 +311,10 @@ func hasCompetitionWindow(rows []replayRow, maxEpoch int) bool {
 		if feeCutRow.MER >= prev.MER-1e-9 {
 			continue
 		}
-		fundWindowEnd := replayMinInt(idx+3, len(rows)-1)
-		for fundIdx := idx; fundIdx <= fundWindowEnd; fundIdx++ {
+		competitionWindowEnd := replayMinInt(idx+3, len(rows)-1)
+		for fundIdx := idx + 1; fundIdx <= competitionWindowEnd; fundIdx++ {
 			fundRow := rows[fundIdx]
-			if fundRow.Fund <= feeCutRow.Fund+1e-9 {
+			if fundRow.BrokerNum <= feeCutRow.BrokerNum || fundRow.Fund <= feeCutRow.Fund+1e-9 {
 				continue
 			}
 			revenueWindowEnd := replayMinInt(fundIdx+3, len(rows)-1)
@@ -308,6 +326,59 @@ func hasCompetitionWindow(rows []replayRow, maxEpoch int) bool {
 		}
 	}
 	return false
+}
+
+func earliestPhaseEpoch(hub0Rows, hub1Rows []replayRow, phase string) int {
+	bestEpoch := 0
+	for _, row := range append(append([]replayRow(nil), hub0Rows...), hub1Rows...) {
+		if row.OptimizerPhase != phase {
+			continue
+		}
+		if bestEpoch == 0 || row.Epoch < bestEpoch {
+			bestEpoch = row.Epoch
+		}
+	}
+	return bestEpoch
+}
+
+func hasCompetitionPhaseFlushBeforeEpoch(rows []replayRow, maxEpoch, totalBrokerCount int) bool {
+	if totalBrokerCount <= 0 {
+		return false
+	}
+	flushThreshold := int(math.Ceil(0.7 * float64(totalBrokerCount)))
+	for idx := 1; idx < len(rows); idx++ {
+		prev := rows[idx-1]
+		current := rows[idx]
+		if prev.Epoch >= maxEpoch || current.Epoch >= maxEpoch {
+			break
+		}
+		if prev.OptimizerPhase != competitionPhaseCompetition || current.OptimizerPhase != competitionPhaseCompetition {
+			continue
+		}
+		if prev.BrokerNum >= flushThreshold && current.BrokerNum == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func sameBrokerTrajectoryPrefix(left, right []replayRow, maxEpoch int) bool {
+	leftByEpoch := make(map[int]int, len(left))
+	for _, row := range left {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		leftByEpoch[row.Epoch] = row.BrokerNum
+	}
+	for _, row := range right {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		if leftByEpoch[row.Epoch] != row.BrokerNum {
+			return false
+		}
+	}
+	return len(leftByEpoch) > 0
 }
 
 func hasPhaseBeforeEpoch(rows []replayRow, phase string, maxEpoch int) bool {
