@@ -7,6 +7,11 @@ const (
 	paperPhaseDominance   = "dominance"
 	paperPhaseShock       = "shock"
 	paperPhaseMemory      = "memory"
+
+	paperWarmupBrokerThreshold        = 2
+	paperWarmupParticipationThreshold = 0.1
+	paperDominanceBrokerThreshold     = 4
+	paperShockBrokerFloor             = 5
 )
 
 type PaperMonopolyConfig struct {
@@ -27,6 +32,7 @@ type PaperMonopolyConfig struct {
 	ShockParticipationDropThreshold float64
 	ShockBrokerDropThreshold        int
 	ShockFundDropThreshold          float64
+	WarmupMinFee                    float64
 	Seed                            int64
 }
 
@@ -49,6 +55,7 @@ type PaperMonopolyOptimizer struct {
 	ShockParticipationDropThreshold float64
 	ShockBrokerDropThreshold        int
 	ShockFundDropThreshold          float64
+	WarmupMinFee                    float64
 
 	FeeRateHistory       []float64
 	RevenueHistory       []float64
@@ -89,7 +96,7 @@ func DefaultPaperMonopolyConfig(initialFunds float64, seed int64) PaperMonopolyC
 		WindowSize:                      5,
 		SuccessThreshold:                4,
 		FailureThreshold:                2,
-		EmergencyInvestedFundsThreshold: 0,
+		EmergencyInvestedFundsThreshold: -1,
 		UpperBoundStartSlack:            0.35,
 		UpperBoundFloorSlack:            0.08,
 		UpperBoundDecayEpoch:            100,
@@ -99,6 +106,7 @@ func DefaultPaperMonopolyConfig(initialFunds float64, seed int64) PaperMonopolyC
 		ShockParticipationDropThreshold: 0.2,
 		ShockBrokerDropThreshold:        3,
 		ShockFundDropThreshold:          0.15,
+		WarmupMinFee:                    0.06,
 		Seed:                            seed,
 	}
 }
@@ -150,6 +158,9 @@ func NewPaperMonopolyOptimizer(id string, cfg PaperMonopolyConfig) *PaperMonopol
 	if cfg.ShockFundDropThreshold == 0 {
 		cfg.ShockFundDropThreshold = defaults.ShockFundDropThreshold
 	}
+	if cfg.WarmupMinFee == 0 {
+		cfg.WarmupMinFee = defaults.WarmupMinFee
+	}
 
 	return &PaperMonopolyOptimizer{
 		ID:                              id,
@@ -170,6 +181,7 @@ func NewPaperMonopolyOptimizer(id string, cfg PaperMonopolyConfig) *PaperMonopol
 		ShockParticipationDropThreshold: cfg.ShockParticipationDropThreshold,
 		ShockBrokerDropThreshold:        cfg.ShockBrokerDropThreshold,
 		ShockFundDropThreshold:          cfg.ShockFundDropThreshold,
+		WarmupMinFee:                    cfg.WarmupMinFee,
 		FeeRateHistory:                  []float64{cfg.InitialTaxRate},
 		RevenueHistory:                  make([]float64, 0),
 		FundsHistory:                    make([]float64, 0),
@@ -189,6 +201,7 @@ func (o *PaperMonopolyOptimizer) Optimize(input EpochMetrics) float64 {
 	investedFunds := math.Max(0, input.CurrentFunds-o.InitialFunds)
 	competitorInvestedFunds := math.Max(0, input.StrongestCompetitorFunds-o.InitialFunds)
 	fundShare := input.CurrentFunds / math.Max(input.CurrentFunds+input.StrongestCompetitorFunds, 1e-9)
+	effectiveMinFee := o.effectiveMinFee(input.BrokerCount, input.ParticipationRate)
 
 	prevParticipation := latestFloat64(o.ParticipationHistory, input.ParticipationRate)
 	prevBrokerCount := latestInt(o.BrokerCountHistory, input.BrokerCount)
@@ -202,29 +215,30 @@ func (o *PaperMonopolyOptimizer) Optimize(input EpochMetrics) float64 {
 
 	o.recordState(input, investedFunds, fundShare)
 	o.updateSuccessFailure()
-	o.updateDominanceStreak(fundShare, input.ParticipationRate)
+	o.updateDominanceStreak(fundShare, input.ParticipationRate, input.BrokerCount)
 	o.LastFeeCutValidated = o.detectValidatedCut(input.Iteration, input.CurrentEarn, investedFunds)
 
 	if input.Iteration <= 2 {
-		o.LastUpperBound = clamp(o.CurrentFeeRate, o.MinFeeRate, o.MaxFeeRate)
+		o.CurrentFeeRate = clamp(o.CurrentFeeRate, effectiveMinFee, o.MaxFeeRate)
+		o.LastUpperBound = clamp(o.CurrentFeeRate, effectiveMinFee, o.MaxFeeRate)
 		o.FeeRateHistory = append(o.FeeRateHistory, o.CurrentFeeRate)
 		return o.CurrentFeeRate
 	}
 
 	if o.detectShock(input.Iteration, prevParticipation, input.ParticipationRate, prevBrokerCount, input.BrokerCount, prevInvestedFunds, investedFunds) {
 		o.CurrentPhase = paperPhaseShock
-		o.CurrentFeeRate = math.Max(o.MinFeeRate, 0.9*o.CriticalMERCap)
+		o.CurrentFeeRate = math.Max(effectiveMinFee, 0.9*o.CriticalMERCap)
 		o.LastUpperBound = o.capAwareUpperBound(input.Iteration)
 		o.FeeRateHistory = append(o.FeeRateHistory, o.CurrentFeeRate)
 		return o.CurrentFeeRate
 	}
 
-	o.CurrentPhase = o.determinePhase(fundShare, input.ParticipationRate)
+	o.CurrentPhase = o.determinePhase(fundShare, input.ParticipationRate, input.BrokerCount)
 	upperBound := o.capAwareUpperBound(input.Iteration)
 	if o.CurrentPhase == paperPhaseDominance && !o.HasCriticalMERCap {
 		upperBound = math.Max(
 			upperBound,
-			clamp(o.CurrentFeeRate+0.08, o.MinFeeRate, o.MaxFeeRate),
+			clamp(o.CurrentFeeRate+0.08, effectiveMinFee, o.MaxFeeRate),
 		)
 	}
 	revenueSlope, fundsSlope := o.recentTrends()
@@ -236,10 +250,20 @@ func (o *PaperMonopolyOptimizer) Optimize(input EpochMetrics) float64 {
 	case paperPhaseMemory:
 		adjustment = o.memoryAdjustment(fundShare, revenueSlope, fundsSlope)
 	default:
-		adjustment = o.competitionAdjustment(investedFunds, competitorInvestedFunds, fundShare, input.ParticipationRate, revenueSlope, fundsSlope)
+		adjustment = o.competitionAdjustment(
+			investedFunds,
+			prevInvestedFunds,
+			competitorInvestedFunds,
+			fundShare,
+			input.ParticipationRate,
+			input.BrokerCount,
+			revenueSlope,
+			fundsSlope,
+		)
 	}
 
-	proposedRate := clamp(o.CurrentFeeRate+adjustment, o.MinFeeRate, upperBound)
+	upperBound = math.Max(upperBound, effectiveMinFee)
+	proposedRate := clamp(o.CurrentFeeRate+adjustment, effectiveMinFee, upperBound)
 	o.trackFeeChange(input.Iteration, input.CurrentEarn, investedFunds, proposedRate)
 	o.CurrentFeeRate = proposedRate
 	o.LastUpperBound = upperBound
@@ -320,16 +344,17 @@ func (o *PaperMonopolyOptimizer) updateSuccessFailure() {
 	}
 }
 
-func (o *PaperMonopolyOptimizer) updateDominanceStreak(fundShare, participationRate float64) {
-	if fundShare >= o.DominanceFundShareThreshold || participationRate >= o.DominanceParticipationThreshold {
+func (o *PaperMonopolyOptimizer) updateDominanceStreak(fundShare, participationRate float64, brokerCount int) {
+	if brokerCount >= paperDominanceBrokerThreshold &&
+		(fundShare >= o.DominanceFundShareThreshold || participationRate >= o.DominanceParticipationThreshold) {
 		o.DominanceStreak++
 		return
 	}
 	o.DominanceStreak = 0
 }
 
-func (o *PaperMonopolyOptimizer) determinePhase(fundShare, participationRate float64) string {
-	if o.DominanceStreak >= o.DominanceStreakThreshold {
+func (o *PaperMonopolyOptimizer) determinePhase(fundShare, participationRate float64, brokerCount int) string {
+	if brokerCount >= paperDominanceBrokerThreshold && o.DominanceStreak >= o.DominanceStreakThreshold {
 		if o.HasCriticalMERCap {
 			return paperPhaseMemory
 		}
@@ -352,6 +377,15 @@ func (o *PaperMonopolyOptimizer) detectValidatedCut(iteration int, currentRevenu
 }
 
 func (o *PaperMonopolyOptimizer) detectShock(iteration int, prevParticipation, currentParticipation float64, prevBrokerCount, currentBrokerCount int, prevInvestedFunds, investedFunds float64) bool {
+	if o.CurrentPhase != paperPhaseDominance {
+		return false
+	}
+	if prevBrokerCount < paperShockBrokerFloor {
+		return false
+	}
+	if o.CurrentFeeRate <= o.WarmupMinFee {
+		return false
+	}
 	if !o.raiseWithinWindow(iteration, 2) {
 		return false
 	}
@@ -399,10 +433,16 @@ func (o *PaperMonopolyOptimizer) recentTrends() (float64, float64) {
 	return CalculateSlope(recentRevenues), CalculateSlope(recentFunds)
 }
 
-func (o *PaperMonopolyOptimizer) competitionAdjustment(investedFunds, competitorInvestedFunds, fundShare, participationRate, revenueSlope, fundsSlope float64) float64 {
-	if investedFunds <= o.EmergencyInvestedFundsThreshold {
+func (o *PaperMonopolyOptimizer) competitionAdjustment(investedFunds, prevInvestedFunds, competitorInvestedFunds, fundShare, participationRate float64, brokerCount int, revenueSlope, fundsSlope float64) float64 {
+	investedFundsRatio := 1.0
+	if prevInvestedFunds > 0 {
+		investedFundsRatio = investedFunds / math.Max(prevInvestedFunds, 1)
+	}
+	if prevInvestedFunds > 0 && investedFundsRatio <= 0.2 &&
+		(o.EmergencyInvestedFundsThreshold < 0 || investedFunds <= o.EmergencyInvestedFundsThreshold) {
 		return -0.008
 	}
+	warmupActive := brokerCount < paperWarmupBrokerThreshold && participationRate < paperWarmupParticipationThreshold
 
 	fundsGapRatio := (competitorInvestedFunds - investedFunds) / math.Max(competitorInvestedFunds+investedFunds, 1)
 	adjustment := -0.002
@@ -432,7 +472,11 @@ func (o *PaperMonopolyOptimizer) competitionAdjustment(investedFunds, competitor
 		adjustment += 0.001
 	}
 
-	return clamp(adjustment, -0.008, 0.002)
+	minAdjustment := -0.008
+	if warmupActive {
+		minAdjustment = -0.004
+	}
+	return clamp(adjustment, minAdjustment, 0.002)
 }
 
 func (o *PaperMonopolyOptimizer) dominanceAdjustment(iteration int, investedFunds, competitorInvestedFunds, fundShare, revenueSlope, fundsSlope float64) float64 {
@@ -462,13 +506,20 @@ func (o *PaperMonopolyOptimizer) memoryAdjustment(fundShare, revenueSlope, funds
 		return 0
 	}
 
-	anchor := math.Min(o.CriticalMERCap*0.9, o.CriticalMERCap-0.002)
+	upperMemoryBound := math.Min(o.CriticalMERCap*0.95, o.CriticalMERCap-0.001)
+	lowerMemoryBound := math.Max(o.MinFeeRate, math.Min(o.CriticalMERCap*0.9, upperMemoryBound-0.003))
+	if upperMemoryBound-lowerMemoryBound < 0.003 {
+		lowerMemoryBound = math.Max(o.MinFeeRate, upperMemoryBound-0.003)
+	}
+
+	anchor := lowerMemoryBound + 0.5*(upperMemoryBound-lowerMemoryBound)
 	if fundShare > 0.92 && revenueSlope >= 0 && fundsSlope >= 0 {
-		anchor = math.Min(o.CriticalMERCap*0.92, o.CriticalMERCap-0.0015)
+		anchor = upperMemoryBound - 0.0005
 	}
 	if revenueSlope < 0 || fundsSlope < 0 {
-		anchor = math.Max(o.MinFeeRate, anchor-0.004)
+		anchor = lowerMemoryBound
 	}
+	anchor = clamp(anchor, lowerMemoryBound, upperMemoryBound)
 	return clamp(anchor-o.CurrentFeeRate, -0.0035, 0.0025)
 }
 
@@ -502,6 +553,13 @@ func (o *PaperMonopolyOptimizer) decayedSlack(iteration int) float64 {
 	}
 	progress := float64(maxInt(iteration-1, 0)) / float64(o.UpperBoundDecayEpoch)
 	return o.UpperBoundStartSlack - progress*(o.UpperBoundStartSlack-o.UpperBoundFloorSlack)
+}
+
+func (o *PaperMonopolyOptimizer) effectiveMinFee(brokerCount int, participationRate float64) float64 {
+	if brokerCount < paperWarmupBrokerThreshold && participationRate < paperWarmupParticipationThreshold {
+		return math.Max(o.MinFeeRate, o.WarmupMinFee)
+	}
+	return o.MinFeeRate
 }
 
 func latestFloat64(values []float64, fallback float64) float64 {

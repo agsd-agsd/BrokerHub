@@ -20,6 +20,7 @@ func URFA_Linear(brokerRawMegs []*message.BrokerRawMeg, BrokerBalance map[string
 	for brokerAddress := range BrokerBalance {
 		brokerAddresses = append(brokerAddresses, brokerAddress)
 	}
+	sort.Strings(brokerAddresses)
 	// build tmp broker balance
 	nowBrokerBalance := make(map[string]*big.Int)
 	for brokerID, _ := range BrokerBalance {

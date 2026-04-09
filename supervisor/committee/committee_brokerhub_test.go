@@ -272,6 +272,55 @@ func TestBrokerBehaviourSimulatorKeepsBrokerInB2EOnRevenueTie(t *testing.T) {
 	}
 }
 
+func TestBrokerBehaviourSimulatorKeepsBrokerInB2EOnPositiveHubTie(t *testing.T) {
+	brokerID := strings.Repeat("b", 40)
+	hubOneID := strings.Repeat("a", 40)
+	hubTwoID := strings.Repeat("c", 40)
+	bcm := newTestBrokerhubCommittee(brokerID)
+
+	bcm.BrokerHubAccountList = []utils.Address{hubOneID, hubTwoID}
+	bcm.Broker.BrokerAddress = []utils.Address{brokerID, hubOneID, hubTwoID}
+	bcm.Broker.BrokerBalance[brokerID] = shardBalances(100)
+	bcm.Broker.BrokerBalance[hubOneID] = shardBalances(200)
+	bcm.Broker.BrokerBalance[hubTwoID] = shardBalances(200)
+	bcm.Broker.LockBalance[hubTwoID] = shardBalances(0)
+	bcm.Broker.ProfitBalance[hubTwoID] = shardProfitBalances()
+	bcm.brokerInfoListInBrokerHub[hubOneID] = []*message.BrokerInfoInBrokerhub{}
+	bcm.brokerInfoListInBrokerHub[hubTwoID] = []*message.BrokerInfoInBrokerhub{}
+	bcm.brokerhubEpochProfit[hubOneID] = big.NewFloat(40)
+	bcm.brokerhubEpochProfit[hubTwoID] = big.NewFloat(40)
+	bcm.brokerhubEpochGrossRevenue[hubOneID] = big.NewFloat(40)
+	bcm.brokerhubEpochGrossRevenue[hubTwoID] = big.NewFloat(40)
+	bcm.feeOptimizers = map[string]optimizerPkg.FeeOptimizer{
+		hubOneID: &staticFeeOptimizer{fee: 0.05},
+		hubTwoID: &staticFeeOptimizer{fee: 0.05},
+	}
+	bcm.hubParams.currentEpoch = 3
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(2)
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to switch working directory: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWd)
+	}()
+	if err := os.MkdirAll("hubres", os.ModePerm); err != nil {
+		t.Fatalf("failed to create hubres directory: %v", err)
+	}
+
+	bcm.writeDataToCsv(true, 0)
+	bcm.broker_behaviour_simulator(true)
+
+	if joinedHub, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
+		t.Fatalf("expected broker to remain in B2E on positive tie, but joined hub %s", joinedHub)
+	}
+}
+
 func TestRefreshDirectUtilityEstimatesUsesTrailingMeanAndInterpolation(t *testing.T) {
 	brokerA := strings.Repeat("b", 40)
 	brokerB := strings.Repeat("c", 40)
@@ -599,7 +648,7 @@ func TestBrokerBehaviourSimulatorAllowsMultipleMovesInOneEpoch(t *testing.T) {
 	}
 }
 
-func TestEstimateHubUtilityDampsEmptyHubWindfall(t *testing.T) {
+func TestEstimateHubUtilityProjectsLowFeeChallengerUplift(t *testing.T) {
 	brokerID := strings.Repeat("b", 40)
 	incumbentHubID := strings.Repeat("a", 40)
 	challengerHubID := strings.Repeat("c", 40)
@@ -608,26 +657,27 @@ func TestEstimateHubUtilityDampsEmptyHubWindfall(t *testing.T) {
 	bcm.BrokerHubAccountList = []utils.Address{incumbentHubID, challengerHubID}
 	bcm.Broker.BrokerAddress = []utils.Address{brokerID, incumbentHubID, challengerHubID}
 	bcm.Broker.BrokerBalance[brokerID] = shardBalances(100)
-	bcm.Broker.BrokerBalance[incumbentHubID] = shardBalances(1000)
-	bcm.Broker.BrokerBalance[challengerHubID] = shardBalances(100)
+	bcm.Broker.BrokerBalance[incumbentHubID] = shardBalances(400)
+	bcm.Broker.BrokerBalance[challengerHubID] = shardBalances(50)
 	bcm.Broker.LockBalance[challengerHubID] = shardBalances(0)
 	bcm.Broker.ProfitBalance[challengerHubID] = shardProfitBalances()
-	bcm.brokerJoinBrokerHubState[brokerID] = incumbentHubID
-	bcm.brokerInfoListInBrokerHub[incumbentHubID] = []*message.BrokerInfoInBrokerhub{
-		{BrokerAddr: brokerID, BrokerBalance: big.NewInt(1800), BrokerProfit: big.NewFloat(0)},
-	}
+	bcm.brokerInfoListInBrokerHub[incumbentHubID] = []*message.BrokerInfoInBrokerhub{}
 	bcm.brokerInfoListInBrokerHub[challengerHubID] = []*message.BrokerInfoInBrokerhub{}
 	bcm.brokerhubEpochGrossRevenue[incumbentHubID] = big.NewFloat(60)
-	bcm.brokerhubEpochGrossRevenue[challengerHubID] = big.NewFloat(12)
+	bcm.brokerhubEpochGrossRevenue[challengerHubID] = big.NewFloat(30)
 	bcm.feeOptimizers = map[string]optimizerPkg.FeeOptimizer{
-		incumbentHubID: &staticFeeOptimizer{fee: 0.15},
-		challengerHubID: &staticFeeOptimizer{fee: 0.15},
+		incumbentHubID:  &staticFeeOptimizer{fee: 0.45},
+		challengerHubID: &staticFeeOptimizer{fee: 0.05},
 	}
 
-	incumbentUtility := bcm.estimateHubUtility(brokerID, incumbentHubID, 0)
-	challengerUtility := bcm.estimateHubUtility(brokerID, challengerHubID, 0)
-	if incumbentUtility <= challengerUtility {
-		t.Fatalf("expected incumbent utility %.6f to stay above empty challenger utility %.6f", incumbentUtility, challengerUtility)
+	directUtility := 10.0
+	incumbentUtility := bcm.estimateHubUtility(brokerID, incumbentHubID, directUtility)
+	challengerUtility := bcm.estimateHubUtility(brokerID, challengerHubID, directUtility)
+	if challengerUtility <= 0 {
+		t.Fatalf("expected projected challenger utility to turn positive, got %.6f", challengerUtility)
+	}
+	if challengerUtility <= incumbentUtility {
+		t.Fatalf("expected challenger utility %.6f to exceed incumbent utility %.6f", challengerUtility, incumbentUtility)
 	}
 }
 

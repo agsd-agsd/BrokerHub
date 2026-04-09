@@ -1,10 +1,14 @@
 package committee
 
 import (
+	"encoding/csv"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"blockEmulator/core"
@@ -48,6 +52,17 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 	logger := &supervisor_log.SupervisorLog{
 		Slog: log.New(io.Discard, "", 0),
 	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	repoRoot := filepath.Clean(filepath.Join(oldWd, "..", ".."))
+	if err := os.Chdir(repoRoot); err != nil {
+		t.Fatalf("failed to switch to repo root: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWd)
+	})
 	stopSignal := signal.NewStopSignal(2 * params.ShardNum)
 	bcm := NewBrokerhubCommitteeMod(
 		map[uint64]map[uint64]string{},
@@ -83,6 +98,56 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 	}
 	if _, err := os.Stat("./hubres/hub1.csv"); err != nil {
 		t.Fatalf("expected hub1.csv to be written, got %v", err)
+	}
+
+	hub0Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub0.csv"))
+	if err != nil {
+		t.Fatalf("failed to parse hub0 replay: %v", err)
+	}
+	hub1Rows, err := loadReplayRows(filepath.Join(repoRoot, "hubres", "hub1.csv"))
+	if err != nil {
+		t.Fatalf("failed to parse hub1 replay: %v", err)
+	}
+	if len(hub0Rows) == 0 || len(hub1Rows) == 0 {
+		t.Fatalf("expected both replays to contain rows, got %d and %d", len(hub0Rows), len(hub1Rows))
+	}
+
+	if !hasNonZeroBrokerBeforeEpoch(hub0Rows, 40) && !hasNonZeroBrokerBeforeEpoch(hub1Rows, 40) {
+		t.Fatal("expected at least one hub to attract brokers before epoch 40")
+	}
+	if !hasCompetitionWindow(hub0Rows, 80) && !hasCompetitionWindow(hub1Rows, 80) {
+		t.Fatal("expected at least one hub to show MER down -> fund up -> lagged revenue up before epoch 80")
+	}
+	if !hasPhaseBeforeEpoch(hub0Rows, "shock", 150) && !hasPhaseBeforeEpoch(hub1Rows, "shock", 150) {
+		t.Fatal("expected at least one shock phase before epoch 150")
+	}
+	if math.Max(maxCriticalCapBeforeEpoch(hub0Rows, 150), maxCriticalCapBeforeEpoch(hub1Rows, 150)) <= 0.06 {
+		t.Fatal("expected a critical MER cap above 0.06 before epoch 150")
+	}
+
+	if !(hasNonZeroBrokerBeforeEpoch(hub0Rows, 150) && hasNonZeroBrokerBeforeEpoch(hub1Rows, 150)) {
+		if countLeaderSwitches(hub0Rows, hub1Rows, 150) < 2 {
+			t.Fatal("expected both hubs to win brokers at least once before epoch 150, or fund-share leadership to switch at least twice")
+		}
+	}
+
+	winnerRows := hub0Rows
+	loserRows := hub1Rows
+	if tailFundShareMean(hub1Rows, 100) > tailFundShareMean(hub0Rows, 100) {
+		winnerRows = hub1Rows
+		loserRows = hub0Rows
+	}
+	if tailPhaseCount(winnerRows, "memory", 100) < 60 {
+		t.Fatal("expected the winner to be memory-dominant in the last 100 epochs")
+	}
+	if tailMERRange(winnerRows, 100) <= 1e-4 {
+		t.Fatal("expected winner MER to keep moving in memory phase instead of flattening completely")
+	}
+	if finalCriticalCap(winnerRows) > 0 && finalTailMaxMER(winnerRows, 100) >= finalCriticalCap(winnerRows) {
+		t.Fatal("expected winner MER to stay below the learned critical MER cap in the last 100 epochs")
+	}
+	if tailPhaseCount(loserRows, "memory", 100) == 100 && tailMERRange(loserRows, 100) <= 1e-4 {
+		t.Fatal("expected loser trajectory to remain responsive rather than collapsing into a flat memory line")
 	}
 }
 
@@ -141,4 +206,240 @@ func runLocalBrokerhubEpoch(
 		)
 	}
 	return restBrokerRawMeg
+}
+
+type replayRow struct {
+	Epoch          int
+	Revenue        float64
+	BrokerNum      int
+	MER            float64
+	Fund           float64
+	FundShare      float64
+	CriticalMERCap float64
+	OptimizerPhase string
+}
+
+func loadReplayRows(path string) ([]replayRow, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	rawRows, err := csv.NewReader(file).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(rawRows) <= 1 {
+		return nil, nil
+	}
+
+	headerIndex := make(map[string]int)
+	for idx, name := range rawRows[0] {
+		headerIndex[name] = idx
+	}
+
+	rows := make([]replayRow, 0, len(rawRows)-1)
+	for _, raw := range rawRows[1:] {
+		rows = append(rows, replayRow{
+			Epoch:          mustParseInt(raw[headerIndex["epoch"]]),
+			Revenue:        mustParseFloat(raw[headerIndex["revenue"]]),
+			BrokerNum:      mustParseInt(raw[headerIndex["broker_num"]]),
+			MER:            mustParseFloat(raw[headerIndex["mer"]]),
+			Fund:           mustParseFloat(raw[headerIndex["fund"]]),
+			FundShare:      mustParseFloat(raw[headerIndex["fund_share"]]),
+			CriticalMERCap: mustParseFloat(raw[headerIndex["critical_mer_cap"]]),
+			OptimizerPhase: raw[headerIndex["optimizer_phase"]],
+		})
+	}
+	return rows, nil
+}
+
+func mustParseInt(value string) int {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func mustParseFloat(value string) float64 {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func hasNonZeroBrokerBeforeEpoch(rows []replayRow, maxEpoch int) bool {
+	for _, row := range rows {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		if row.BrokerNum > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCompetitionWindow(rows []replayRow, maxEpoch int) bool {
+	for idx := 1; idx < len(rows); idx++ {
+		prev := rows[idx-1]
+		feeCutRow := rows[idx]
+		if feeCutRow.Epoch > maxEpoch {
+			break
+		}
+		if feeCutRow.MER >= prev.MER-1e-9 {
+			continue
+		}
+		fundWindowEnd := replayMinInt(idx+3, len(rows)-1)
+		for fundIdx := idx; fundIdx <= fundWindowEnd; fundIdx++ {
+			fundRow := rows[fundIdx]
+			if fundRow.Fund <= feeCutRow.Fund+1e-9 {
+				continue
+			}
+			revenueWindowEnd := replayMinInt(fundIdx+3, len(rows)-1)
+			for revenueIdx := fundIdx; revenueIdx <= revenueWindowEnd; revenueIdx++ {
+				if rows[revenueIdx].Revenue > feeCutRow.Revenue+1e-9 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasPhaseBeforeEpoch(rows []replayRow, phase string, maxEpoch int) bool {
+	for _, row := range rows {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		if row.OptimizerPhase == phase {
+			return true
+		}
+	}
+	return false
+}
+
+func maxCriticalCapBeforeEpoch(rows []replayRow, maxEpoch int) float64 {
+	best := 0.0
+	for _, row := range rows {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		if row.CriticalMERCap > best {
+			best = row.CriticalMERCap
+		}
+	}
+	return best
+}
+
+func countLeaderSwitches(hub0Rows, hub1Rows []replayRow, maxEpoch int) int {
+	hub0ByEpoch := make(map[int]float64, len(hub0Rows))
+	for _, row := range hub0Rows {
+		if row.Epoch <= maxEpoch {
+			hub0ByEpoch[row.Epoch] = row.FundShare
+		}
+	}
+	lastLeader := 0
+	switches := 0
+	for _, row := range hub1Rows {
+		if row.Epoch > maxEpoch {
+			break
+		}
+		hub0Share, ok := hub0ByEpoch[row.Epoch]
+		if !ok {
+			continue
+		}
+		leader := 0
+		switch {
+		case hub0Share > row.FundShare+1e-9:
+			leader = 1
+		case row.FundShare > hub0Share+1e-9:
+			leader = -1
+		}
+		if leader == 0 {
+			continue
+		}
+		if lastLeader != 0 && leader != lastLeader {
+			switches++
+		}
+		lastLeader = leader
+	}
+	return switches
+}
+
+func tailFundShareMean(rows []replayRow, window int) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	if len(rows) < window {
+		window = len(rows)
+	}
+	total := 0.0
+	for _, row := range rows[len(rows)-window:] {
+		total += row.FundShare
+	}
+	return total / float64(window)
+}
+
+func tailPhaseCount(rows []replayRow, phase string, window int) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	if len(rows) < window {
+		window = len(rows)
+	}
+	count := 0
+	for _, row := range rows[len(rows)-window:] {
+		if row.OptimizerPhase == phase {
+			count++
+		}
+	}
+	return count
+}
+
+func tailMERRange(rows []replayRow, window int) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	if len(rows) < window {
+		window = len(rows)
+	}
+	minMER := rows[len(rows)-window].MER
+	maxMER := minMER
+	for _, row := range rows[len(rows)-window:] {
+		minMER = math.Min(minMER, row.MER)
+		maxMER = math.Max(maxMER, row.MER)
+	}
+	return maxMER - minMER
+}
+
+func finalCriticalCap(rows []replayRow) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	return rows[len(rows)-1].CriticalMERCap
+}
+
+func finalTailMaxMER(rows []replayRow, window int) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	if len(rows) < window {
+		window = len(rows)
+	}
+	best := 0.0
+	for _, row := range rows[len(rows)-window:] {
+		best = math.Max(best, row.MER)
+	}
+	return best
+}
+
+func replayMinInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }

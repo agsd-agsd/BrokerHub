@@ -30,6 +30,30 @@ func TestPaperMonopolyOptimizerKeepsInitialFeeForFirstTwoIterations(t *testing.T
 	}
 }
 
+func TestPaperMonopolyWarmupPreventsImmediateFloorCut(t *testing.T) {
+	opt := NewPaperMonopolyOptimizer("hub-1", DefaultPaperMonopolyConfig(1000, 42))
+
+	lastRate := opt.CurrentFeeRate
+	for iteration := 1; iteration <= 15; iteration++ {
+		lastRate = opt.Optimize(EpochMetrics{
+			Iteration:                iteration,
+			ParticipationRate:        0.05,
+			BrokerCount:              0,
+			CurrentFunds:             1000,
+			CurrentEarn:              0,
+			StrongestCompetitorFunds: 1200,
+			StrongestCompetitorEarn:  12,
+		})
+	}
+
+	if lastRate < 0.06-1e-9 {
+		t.Fatalf("expected warmup floor to keep fee at or above 0.06, got %f", lastRate)
+	}
+	if lastRate <= opt.MinFeeRate+1e-9 {
+		t.Fatalf("expected warmup to avoid collapsing to min fee %f, got %f", opt.MinFeeRate, lastRate)
+	}
+}
+
 func TestPaperMonopolyCompetitionCutsFeeWhenTrailing(t *testing.T) {
 	cfg := DefaultPaperMonopolyConfig(1000, 42)
 	cfg.EmergencyInvestedFundsThreshold = -1
@@ -126,6 +150,7 @@ func TestPaperMonopolyOptimizerRecordsCriticalCapOnShock(t *testing.T) {
 	cfg.EmergencyInvestedFundsThreshold = -1
 	opt := NewPaperMonopolyOptimizer("hub-1", cfg)
 	opt.CurrentFeeRate = 0.2
+	opt.CurrentPhase = paperPhaseDominance
 	opt.LastRaiseEpoch = 3
 	opt.ParticipationHistory = []float64{0.95}
 	opt.BrokerCountHistory = []int{20}
@@ -159,6 +184,42 @@ func TestPaperMonopolyOptimizerRecordsCriticalCapOnShock(t *testing.T) {
 	}
 	if math.Abs(rate-0.18) > 1e-9 {
 		t.Fatalf("expected post-shock fallback fee 0.18, got %f", rate)
+	}
+}
+
+func TestPaperMonopolyOptimizerIgnoresWarmupShockCap(t *testing.T) {
+	cfg := DefaultPaperMonopolyConfig(1000, 42)
+	cfg.EmergencyInvestedFundsThreshold = -1
+	opt := NewPaperMonopolyOptimizer("hub-1", cfg)
+	opt.CurrentFeeRate = 0.06
+	opt.CurrentPhase = paperPhaseDominance
+	opt.LastRaiseEpoch = 3
+	opt.ParticipationHistory = []float64{0.95}
+	opt.BrokerCountHistory = []int{20}
+	opt.InvestedFundsHistory = []float64{1400}
+	opt.RevenueHistory = []float64{50}
+	opt.FundShareHistory = []float64{0.9}
+	opt.FundsHistory = []float64{2400}
+
+	rate := opt.Optimize(EpochMetrics{
+		Iteration:                4,
+		ParticipationRate:        0.7,
+		BrokerCount:              16,
+		CurrentFunds:             1700,
+		CurrentEarn:              25,
+		StrongestCompetitorFunds: 1300,
+		StrongestCompetitorEarn:  15,
+	})
+
+	debug := opt.DebugState()
+	if debug.OptimizerPhase == paperPhaseShock {
+		t.Fatalf("expected warmup-level fee to avoid shock phase, got %q", debug.OptimizerPhase)
+	}
+	if debug.HasCriticalMERCap {
+		t.Fatalf("expected no critical cap to be recorded at warmup fee, got %f", debug.CriticalMERCap)
+	}
+	if rate < opt.MinFeeRate-1e-9 {
+		t.Fatalf("expected fee to stay above optimizer min fee %f, got %f", opt.MinFeeRate, rate)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"blockEmulator/utils"
 	"math/big"
 	"math/rand"
+	"sort"
 	"sync"
 )
 
@@ -32,6 +33,7 @@ func B2E_Rounding(RatioBrokerRawMegs []*RatioBrokerRawMeg, BrokerBalance map[str
 	for brokerAddress := range BrokerBalance {
 		brokerAddresses = append(brokerAddresses, brokerAddress)
 	}
+	sort.Strings(brokerAddresses)
 
 	// 1. build map broker address -> tx & ratio, tx -? broker
 	broker2Tx := make(map[utils.Address][]*core.Transaction)

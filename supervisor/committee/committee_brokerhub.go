@@ -643,23 +643,7 @@ func (bcm *BrokerhubCommitteeMod) calManagementExpanseRatio(epochTxSamples []opt
 
 			opt.Optimize(iteration, myFunds, competitorFunds, currentEarn, competitorEarn)
 		*/
-		strongestCompetitorFunds := 0.0
-		strongestCompetitorEarn := 0.0
-		for _, competitorID := range bcm.BrokerHubAccountList {
-			if competitorID == brokerhub_id {
-				continue
-			}
-			competitorFunds := bigIntToFloat64(bcm.calculateTotalBalance(competitorID))
-			if competitorFunds < strongestCompetitorFunds {
-				continue
-			}
-			strongestCompetitorFunds = competitorFunds
-			if profit, ok := bcm.brokerhubEpochProfit[competitorID]; ok {
-				strongestCompetitorEarn, _ = profit.Float64()
-			} else {
-				strongestCompetitorEarn = 0
-			}
-		}
+		strongestCompetitorFunds, strongestCompetitorEarn := bcm.strongestCompetitorSnapshot(brokerhub_id)
 		opt := bcm.feeOptimizers[brokerhub_id]
 		if opt == nil {
 			continue
@@ -1186,6 +1170,27 @@ func (bcm *BrokerhubCommitteeMod) totalManagedBrokerFunds(hubID string) float64 
 	return total
 }
 
+func (bcm *BrokerhubCommitteeMod) strongestCompetitorSnapshot(hubID string) (float64, float64) {
+	strongestCompetitorFunds := 0.0
+	strongestCompetitorEarn := 0.0
+	for _, competitorID := range bcm.BrokerHubAccountList {
+		if competitorID == hubID {
+			continue
+		}
+		competitorFunds := bcm.brokerFundsFloat64(competitorID)
+		if competitorFunds < strongestCompetitorFunds {
+			continue
+		}
+		strongestCompetitorFunds = competitorFunds
+		if profit, ok := bcm.brokerhubEpochProfit[competitorID]; ok && profit != nil {
+			strongestCompetitorEarn, _ = profit.Float64()
+		} else {
+			strongestCompetitorEarn = 0
+		}
+	}
+	return strongestCompetitorFunds, strongestCompetitorEarn
+}
+
 func (bcm *BrokerhubCommitteeMod) refreshDirectUtilityEstimates() {
 	type candidateSample struct {
 		id     string
@@ -1225,7 +1230,13 @@ func (bcm *BrokerhubCommitteeMod) refreshDirectUtilityEstimates() {
 			bcm.brokerDirectUtilityEst[brokerID] = 0
 			continue
 		}
-		if directUtility, ok := bcm.brokerTrailingDirectUtility(brokerID, true); ok {
+		if _, joined := bcm.brokerJoinBrokerHubState[brokerID]; !joined {
+			if directUtility, ok := bcm.brokerTrailingDirectUtility(brokerID, true); ok {
+				bcm.brokerDirectUtilityEst[brokerID] = directUtility
+				continue
+			}
+		}
+		if directUtility, ok := bcm.brokerTrailingDirectUtility(brokerID, false); ok && len(candidates) == 0 {
 			bcm.brokerDirectUtilityEst[brokerID] = directUtility
 			continue
 		}
@@ -1261,8 +1272,10 @@ func (bcm *BrokerhubCommitteeMod) refreshDirectUtilityEstimates() {
 }
 
 func (bcm *BrokerhubCommitteeMod) estimateDirectUtility(brokerID string) float64 {
-	if directUtility, ok := bcm.brokerTrailingDirectUtility(brokerID, true); ok {
-		return directUtility
+	if _, joined := bcm.brokerJoinBrokerHubState[brokerID]; !joined {
+		if directUtility, ok := bcm.brokerTrailingDirectUtility(brokerID, true); ok {
+			return directUtility
+		}
 	}
 	if directUtility, ok := bcm.brokerDirectUtilityEst[brokerID]; ok {
 		return directUtility
@@ -1303,6 +1316,10 @@ func clampFloat64(value, minValue, maxValue float64) float64 {
 	return value
 }
 
+func utilityTieTolerance(left, right float64) float64 {
+	return 1e-6
+}
+
 func (bcm *BrokerhubCommitteeMod) estimateHubUtility(brokerID, brokerhubID string, directUtility float64) float64 {
 	brokerFunds := bcm.brokerFundsFloat64(brokerID)
 	if brokerFunds <= 0 {
@@ -1314,16 +1331,35 @@ func (bcm *BrokerhubCommitteeMod) estimateHubUtility(brokerID, brokerhubID strin
 		return math.Inf(-1)
 	}
 
-	grossRevenueRate := bcm.hubGrossRevenueRate(brokerhubID)
-	hubFunds := bcm.brokerFundsFloat64(brokerhubID)
-	if grossRevenueRate <= 0 || hubFunds <= 0 {
+	currentHubFunds := bcm.brokerFundsFloat64(brokerhubID)
+	if currentHubFunds <= 0 {
 		return -directUtility
 	}
-	dilutionFactor := 1.0
+
+	projectedPoolFunds := currentHubFunds
 	if currentHubID, joined := bcm.brokerJoinBrokerHubState[brokerID]; !joined || currentHubID != brokerhubID {
-		dilutionFactor = hubFunds / (hubFunds + brokerFunds)
+		projectedPoolFunds += brokerFunds
 	}
-	expectedPayout := grossRevenueRate * brokerFunds * (1 - opt.FeeRate()) * dilutionFactor
+	projectedPoolFunds = math.Max(projectedPoolFunds, brokerFunds)
+	projectedBrokerShare := brokerFunds / math.Max(projectedPoolFunds, 1e-9)
+
+	baseRevenueRate := math.Max(
+		bcm.hubGrossRevenueRate(brokerhubID),
+		bcm.marketGrossRevenueRate(),
+	)
+	if baseRevenueRate <= 0 {
+		return -directUtility
+	}
+
+	strongestCompetitorFunds, _ := bcm.strongestCompetitorSnapshot(brokerhubID)
+	scaleBoost := 1 + 0.35*math.Log1p(projectedPoolFunds/math.Max(currentHubFunds, 1))
+	rankBoost := 1 + 0.25*math.Max(
+		0,
+		(projectedPoolFunds-strongestCompetitorFunds)/math.Max(strongestCompetitorFunds, 1),
+	)
+	projectedBoost := clampFloat64(scaleBoost*rankBoost, 1.0, 1.8)
+	projectedGrossRevenue := projectedPoolFunds * baseRevenueRate * projectedBoost
+	expectedPayout := (1 - opt.FeeRate()) * projectedBrokerShare * projectedGrossRevenue
 	return expectedPayout - directUtility
 }
 
@@ -1351,7 +1387,6 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 	bcm.writeDataToCsv(false, len(epochTxSamples))
 	bcm.refreshDirectUtilityEstimates()
 	broker_decision_map := make(map[string]string)
-	const utilityTolerance = 1e-6
 	for _, broker_id := range bcm.Broker.BrokerAddress {
 		if slices.Contains(bcm.BrokerHubAccountList, broker_id) {
 			continue
@@ -1372,11 +1407,12 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 				brokerhub_id,
 				directUtility,
 			)
-			if hubUtility > bestHubUtility+utilityTolerance {
+			tieTolerance := utilityTieTolerance(hubUtility, bestHubUtility)
+			if hubUtility > bestHubUtility+tieTolerance {
 				bestHubID = brokerhub_id
 				bestHubUtility = hubUtility
 				bestHubTie = false
-			} else if math.Abs(hubUtility-bestHubUtility) <= utilityTolerance {
+			} else if math.Abs(hubUtility-bestHubUtility) <= tieTolerance {
 				bestHubTie = true
 			}
 			if broker_is_in_hub && brokerhub_id == broker_joined_hub_id {
@@ -1384,7 +1420,7 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 			}
 		}
 		switch {
-		case bestHubUtility <= utilityTolerance:
+		case bestHubUtility <= 1e-6:
 			broker_decision_map[broker_id] = "b2e"
 		case bestHubTie:
 			if broker_is_in_hub {
@@ -1392,7 +1428,7 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 			} else {
 				broker_decision_map[broker_id] = "b2e"
 			}
-		case broker_is_in_hub && math.Abs(bestHubUtility-currentHubUtility) <= utilityTolerance:
+		case broker_is_in_hub && math.Abs(bestHubUtility-currentHubUtility) <= utilityTieTolerance(bestHubUtility, currentHubUtility):
 			broker_decision_map[broker_id] = broker_joined_hub_id
 		default:
 			broker_decision_map[broker_id] = bestHubID
