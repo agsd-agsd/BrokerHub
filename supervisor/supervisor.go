@@ -41,6 +41,36 @@ import (
 	"github.com/google/uuid"
 )
 
+func (d *Supervisor) waitForAllShardNodes(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastMissing []string
+
+	for time.Now().Before(deadline) {
+		missing := make([]string, 0)
+		for sid := uint64(0); sid < d.ChainConfig.ShardNums; sid++ {
+			for nid := uint64(0); nid < d.ChainConfig.Nodes_perShard; nid++ {
+				addr := d.Ip_nodeTable[sid][nid]
+				conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+				if err != nil {
+					missing = append(missing, fmt.Sprintf("S%dN%d(%s)", sid, nid, addr))
+					continue
+				}
+				conn.Close()
+			}
+		}
+
+		if len(missing) == 0 {
+			d.sl.Slog.Printf("all shard nodes are reachable, starting workload")
+			return nil
+		}
+
+		lastMissing = missing
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return fmt.Errorf("not all shard nodes are reachable before startup deadline: %v", lastMissing)
+}
+
 type Supervisor struct {
 	// basic infos
 	IPaddr       string // ip address of this Supervisor
@@ -96,7 +126,17 @@ func (d *Supervisor) NewSupervisor(ip string, pcc *params.ChainConfig, committee
 		d.ComMod = committee.NewBrokerCommitteeMod(d.Ip_nodeTable, d.Ss, d.sl, params.FileInput, params.TotalDataSize, params.BatchSize)
 	case "Broker_b2e":
 		// d.ComMod = committee.NewBrokerCommitteeMod_b2e(d.Ip_nodeTable, d.Ss, d.sl, params.FileInput, params.TotalDataSize, params.BatchSize)
-		d.ComMod = committee.NewBrokerhubCommitteeMod(d.Ip_nodeTable, d.Ss, d.sl, params.FileInput, params.TotalDataSize, params.BatchSize)
+		d.ComMod = committee.NewBrokerhubCommitteeMod(
+			d.Ip_nodeTable,
+			d.Ss,
+			d.sl,
+			params.FileInput,
+			params.TotalDataSize,
+			params.BatchSize,
+			params.ExchangeMode,
+			params.FeeOptimizerMode,
+			params.SimSeed,
+		)
 	default:
 		d.ComMod = committee.NewRelayCommitteeModule(d.Ip_nodeTable, d.Ss, d.sl, params.FileInput, params.TotalDataSize, params.BatchSize)
 	}
@@ -156,16 +196,14 @@ func (d *Supervisor) handleBlockInfos(content []byte) {
 // the Supervisor will do re-partition and send partitionMSG and txs to leaders.
 
 func (d *Supervisor) SupervisorTxHandling() {
+	if err := d.waitForAllShardNodes(15 * time.Second); err != nil {
+		log.Panic(err)
+	}
 
 	d.ComMod.MsgSendingControl()
 
 	// TxHandling is end
-	//for !d.Ss.GapEnough() { // wait all txs to be handled
-	//	time.Sleep(time.Second)
-	//}
-
-	//add
-	for true {
+	for !d.Ss.GapEnough() { // wait all txs to be handled
 		time.Sleep(time.Second)
 	}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"blockEmulator/build"
+	"blockEmulator/params"
 	"blockEmulator/vm/state"
 	"encoding/gob"
 	"encoding/json"
@@ -13,13 +14,16 @@ import (
 )
 
 var (
-	shardNum int
-	nodeNum  int
-	shardID  int
-	nodeID   int
-	modID    int
-	isClient bool
-	isGen    bool
+	shardNum         int
+	nodeNum          int
+	shardID          int
+	nodeID           int
+	modID            int
+	exchangeMode     string
+	feeOptimizerMode string
+	simSeed          int64
+	isClient         bool
+	isGen            bool
 )
 
 type A interface {
@@ -205,10 +209,8 @@ func test() {
 
 }
 
-//TODO 执行一个合约时分片内共用一个statedb
+// TODO 执行一个合约时分片内共用一个statedb
 func main() {
-
-
 
 	//fp := "./record/ldb"
 	//db, _ := rawdb.NewLevelDBDatabase(fp, 0, 1, "accountState", false)
@@ -295,10 +297,8 @@ func main() {
 	//
 	//return
 
-
 	//fmt.Println(uuid.New().String())
 	//return
-
 
 	//0xd82cf790000000000000000000000000000000000000000000000000000000000000007b
 	//s:="getA(uint256)"
@@ -349,27 +349,38 @@ func main() {
 	pflag.IntVarP(&shardID, "shardID", "s", 0, "id of the shard to which this node belongs, for example, 0")
 	pflag.IntVarP(&nodeID, "nodeID", "n", 0, "id of this node, for example, 0")
 	pflag.IntVarP(&modID, "modID", "m", 4, "choice Committee Method,for example, 0, [CLPA_Broker,CLPA,Broker,Relay,Broker_b2e] ")
+	pflag.StringVarP(&exchangeMode, "exchange_mode", "e", params.ExchangeModeInfinite, "BrokerHub exchange mode: infinite, limit100, or limit300")
+	pflag.StringVar(&feeOptimizerMode, "fee_optimizer", params.FeeOptimizerModeTaxRate, "BrokerHub fee optimizer mode: taxrate or paper_monopoly")
+	pflag.Int64Var(&simSeed, "sim_seed", 0, "optional simulation seed, 0 keeps current non-deterministic behavior")
 	pflag.BoolVarP(&isClient, "client", "c", false, "whether this node is a client")
 	pflag.BoolVarP(&isGen, "gen", "g", false, "generation bat")
 	pflag.Parse()
 
+	if err := params.SetExchangeMode(exchangeMode); err != nil {
+		panic(err)
+	}
+	if err := params.SetFeeOptimizerMode(feeOptimizerMode); err != nil {
+		panic(err)
+	}
+	params.SimSeed = simSeed
+
 	//return
 	if isGen {
-		build.GenerateBatFile(nodeNum, shardNum, modID)
-		build.GenerateShellFile(nodeNum, shardNum, modID)
+		build.GenerateBatFile(nodeNum, shardNum, modID, params.ExchangeMode, params.FeeOptimizerMode, params.SimSeed)
+		build.GenerateShellFile(nodeNum, shardNum, modID, params.ExchangeMode, params.FeeOptimizerMode, params.SimSeed)
 		return
 	}
 
 	if isClient {
 		go func() {
-			if err := http.ListenAndServe(fmt.Sprintf(":%d",11999), nil); err != nil {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", 11999), nil); err != nil {
 				panic("pprof server start error: " + err.Error())
 			}
 		}()
 		build.BuildSupervisor(uint64(nodeNum), uint64(shardNum), uint64(modID))
 	} else {
 		go func() {
-			if err := http.ListenAndServe(fmt.Sprintf(":%d",12000+shardID*10+nodeID), nil); err != nil {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", 12000+shardID*10+nodeID), nil); err != nil {
 				panic("pprof server start error: " + err.Error())
 			}
 		}()

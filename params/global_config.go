@@ -18,4 +18,5 @@ var (
 	FileInput           = "./TXs.csv"       //the raw BlockTransaction data path
 	NodeID              uint64
 	ShardID             uint64
+	SimSeed             int64
 )

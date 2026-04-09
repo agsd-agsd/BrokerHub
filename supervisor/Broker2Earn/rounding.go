@@ -6,7 +6,12 @@ import (
 	"blockEmulator/utils"
 	"math/big"
 	"math/rand"
-	"time"
+	"sync"
+)
+
+var (
+	randomSourceMu sync.Mutex
+	randomSource   = rand.New(rand.NewSource(1))
 )
 
 // Broker2earn rounding functin
@@ -93,8 +98,9 @@ func B2E_Rounding(RatioBrokerRawMegs []*RatioBrokerRawMeg, BrokerBalance map[str
 }
 
 func Random_choice(probility []float64) int {
-	rand.Seed(time.Now().UnixNano())
-	r := rand.Float64()
+	randomSourceMu.Lock()
+	r := randomSource.Float64()
+	randomSourceMu.Unlock()
 
 	// 初始化累积概率
 	cumulativeProb := 0.0
@@ -107,4 +113,13 @@ func Random_choice(probility []float64) int {
 		}
 	}
 	return -1
+}
+
+func SetRandomSeed(seed int64) {
+	if seed == 0 {
+		return
+	}
+	randomSourceMu.Lock()
+	randomSource = rand.New(rand.NewSource(seed))
+	randomSourceMu.Unlock()
 }
