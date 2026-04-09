@@ -46,6 +46,42 @@ type competitionDecisionState struct {
 	ConsecutiveEpochs int
 }
 
+type competitionDecisionTuning struct {
+	FeeHistoryWindow         int
+	JoinConfirmEpochs        int
+	SwitchConfirmEpochs      int
+	ExitConfirmEpochs        int
+	JoinMarginBase           float64
+	SwitchMarginBase         float64
+	ExitMarginBase           float64
+	JoinSwitchUtilityScale   float64
+	ExitUtilityScale         float64
+	SwitchScaleCap           float64
+	IncumbentRetentionMargin float64
+	RecentFeeCutWeight       float64
+	FeeGapWeight             float64
+	AttractionBoostCap       float64
+}
+
+func defaultCompetitionDecisionTuning() competitionDecisionTuning {
+	return competitionDecisionTuning{
+		FeeHistoryWindow:         4,
+		JoinConfirmEpochs:        3,
+		SwitchConfirmEpochs:      3,
+		ExitConfirmEpochs:        3,
+		JoinMarginBase:           2.55,
+		SwitchMarginBase:         2.95,
+		ExitMarginBase:           1.28,
+		JoinSwitchUtilityScale:   0.12,
+		ExitUtilityScale:         0.07,
+		SwitchScaleCap:           2.20,
+		IncumbentRetentionMargin: 0.78,
+		RecentFeeCutWeight:       0.60,
+		FeeGapWeight:             0.25,
+		AttractionBoostCap:       1.12,
+	}
+}
+
 // CLPA committee operations
 type BrokerhubCommitteeMod struct {
 	csvPath      string
@@ -113,9 +149,10 @@ type BrokerhubCommitteeMod struct {
 	nonEmptyBlockInfoCount  uint64
 	lastBlockInfoSnapshot   uint64
 
-	feeOptimizerMode string
-	simSeed          int64
-	rng              *rand.Rand
+	feeOptimizerMode  string
+	simSeed           int64
+	rng               *rand.Rand
+	competitionTuning competitionDecisionTuning
 
 	hubParams simulation_param
 }
@@ -245,6 +282,7 @@ func NewBrokerhubCommitteeMod(Ip_nodeTable map[uint64]map[uint64]string, Ss *sig
 		feeOptimizerMode:           normalizedFeeOptimizerMode,
 		simSeed:                    simSeed,
 		rng:                        rng,
+		competitionTuning:          defaultCompetitionDecisionTuning(),
 		hubParams:                  simulation_parameters,
 	}
 
@@ -1318,11 +1356,6 @@ const (
 
 	competitionPhaseCompetition = "competition"
 	competitionPhaseShock       = "shock"
-
-	competitionFeeHistoryWindow   = 4
-	competitionConfirmEpochs      = 2
-	competitionMarginScaleCap     = 0.25
-	competitionAttractionBoostCap = 1.35
 )
 
 func utilityTieTolerance(left, right float64) float64 {
@@ -1334,8 +1367,8 @@ func (bcm *BrokerhubCommitteeMod) recordObservedHubFee(hubID string, feeRate flo
 		bcm.hubObservedFeeHistory = make(map[string][]float64)
 	}
 	history := append(bcm.hubObservedFeeHistory[hubID], feeRate)
-	if len(history) > competitionFeeHistoryWindow {
-		history = append([]float64(nil), history[len(history)-competitionFeeHistoryWindow:]...)
+	if len(history) > bcm.competitionTuning.FeeHistoryWindow {
+		history = append([]float64(nil), history[len(history)-bcm.competitionTuning.FeeHistoryWindow:]...)
 	}
 	bcm.hubObservedFeeHistory[hubID] = history
 }
@@ -1414,16 +1447,16 @@ func (bcm *BrokerhubCommitteeMod) competitionSwitchScales() map[string]float64 {
 		if len(brokerRanks) > 1 {
 			normalizedRank = float64(idx) / float64(len(brokerRanks)-1)
 		}
-		switchScales[rankedBroker.id] = 1 + competitionMarginScaleCap*normalizedRank
+		switchScales[rankedBroker.id] = 1 + bcm.competitionTuning.SwitchScaleCap*normalizedRank
 	}
 	return switchScales
 }
 
-func competitionMargins(bestHubUtility, currentHubUtility, switchScale float64) (float64, float64, float64) {
+func (bcm *BrokerhubCommitteeMod) competitionMargins(bestHubUtility, currentHubUtility, switchScale float64) (float64, float64, float64) {
 	maxAbsUtility := math.Max(1.0, math.Max(math.Abs(bestHubUtility), math.Abs(currentHubUtility)))
-	joinMargin := math.Max(0.75, 0.05*maxAbsUtility)
-	switchMargin := math.Max(0.75, 0.05*maxAbsUtility)
-	exitMargin := math.Max(0.50, 0.03*maxAbsUtility)
+	joinMargin := math.Max(bcm.competitionTuning.JoinMarginBase, bcm.competitionTuning.JoinSwitchUtilityScale*maxAbsUtility)
+	switchMargin := math.Max(bcm.competitionTuning.SwitchMarginBase, bcm.competitionTuning.JoinSwitchUtilityScale*maxAbsUtility)
+	exitMargin := math.Max(bcm.competitionTuning.ExitMarginBase, bcm.competitionTuning.ExitUtilityScale*maxAbsUtility)
 	return joinMargin * switchScale, switchMargin * switchScale, exitMargin * switchScale
 }
 
@@ -1500,9 +1533,9 @@ func (bcm *BrokerhubCommitteeMod) estimateHubUtility(brokerID, brokerhubID strin
 		strongestCompetitorFee := bcm.strongestCompetitorFeeRate(brokerhubID, currentFeeRate)
 		feeGap := math.Max(0, strongestCompetitorFee-currentFeeRate)
 		competitionAttractionBoost := clampFloat64(
-			1+1.6*recentFeeCut+0.9*feeGap,
+			1+bcm.competitionTuning.RecentFeeCutWeight*recentFeeCut+bcm.competitionTuning.FeeGapWeight*feeGap,
 			1.0,
-			competitionAttractionBoostCap,
+			bcm.competitionTuning.AttractionBoostCap,
 		)
 		projectedGrossRevenue *= competitionAttractionBoost
 	}
@@ -1575,7 +1608,7 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 		if !math.IsInf(currentHubUtility, 0) && !math.IsNaN(currentHubUtility) {
 			currentUtilityForMargin = currentHubUtility
 		}
-		joinMargin, switchMargin, exitMargin := competitionMargins(bestHubUtility, currentUtilityForMargin, switchScale)
+		joinMargin, switchMargin, exitMargin := bcm.competitionMargins(bestHubUtility, currentUtilityForMargin, switchScale)
 		switch {
 		case bestHubTie && (!broker_is_in_hub || bestHubUtility > 1e-6):
 			bcm.clearCompetitionDecisionState(broker_id)
@@ -1589,6 +1622,7 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 			broker_decision_map[broker_id] = broker_joined_hub_id
 		case !broker_is_in_hub:
 			bestPhase := bcm.hubOptimizerPhase(bestHubID)
+			joinThreshold := joinMargin + bcm.competitionTuning.IncumbentRetentionMargin
 			if bestHubUtility <= 1e-6 {
 				bcm.clearCompetitionDecisionState(broker_id)
 				broker_decision_map[broker_id] = competitionPendingModeB2E
@@ -1599,12 +1633,12 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 				broker_decision_map[broker_id] = bestHubID
 				continue
 			}
-			if bestHubUtility < joinMargin {
+			if bestHubUtility < joinThreshold {
 				bcm.clearCompetitionDecisionState(broker_id)
 				broker_decision_map[broker_id] = competitionPendingModeB2E
 				continue
 			}
-			if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= competitionConfirmEpochs {
+			if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= bcm.competitionTuning.JoinConfirmEpochs {
 				bcm.clearCompetitionDecisionState(broker_id)
 				broker_decision_map[broker_id] = bestHubID
 				continue
@@ -1627,8 +1661,10 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 				broker_decision_map[broker_id] = bestHubID
 				continue
 			}
-			if bestHubID != "" && bestHubID != broker_joined_hub_id && bestHubUtility-currentHubUtility >= switchMargin {
-				if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= competitionConfirmEpochs {
+			switchThreshold := switchMargin + bcm.competitionTuning.IncumbentRetentionMargin
+			exitThreshold := exitMargin + bcm.competitionTuning.IncumbentRetentionMargin
+			if bestHubID != "" && bestHubID != broker_joined_hub_id && bestHubUtility-currentHubUtility >= switchThreshold {
+				if bcm.observeCompetitionDecision(broker_id, bestHubID, competitionPendingModeHub) >= bcm.competitionTuning.SwitchConfirmEpochs {
 					bcm.clearCompetitionDecisionState(broker_id)
 					broker_decision_map[broker_id] = bestHubID
 					continue
@@ -1636,8 +1672,8 @@ func (bcm *BrokerhubCommitteeMod) broker_behaviour_simulator(should_simulate boo
 				broker_decision_map[broker_id] = broker_joined_hub_id
 				continue
 			}
-			if -currentHubUtility >= exitMargin {
-				if bcm.observeCompetitionDecision(broker_id, competitionPendingModeB2E, competitionPendingModeB2E) >= competitionConfirmEpochs {
+			if -currentHubUtility >= exitThreshold {
+				if bcm.observeCompetitionDecision(broker_id, competitionPendingModeB2E, competitionPendingModeB2E) >= bcm.competitionTuning.ExitConfirmEpochs {
 					bcm.clearCompetitionDecisionState(broker_id)
 					broker_decision_map[broker_id] = competitionPendingModeB2E
 					continue

@@ -75,6 +75,9 @@ func TestPaperMonopolyCompetitionCutsFeeWhenTrailing(t *testing.T) {
 	if opt.DebugState().OptimizerPhase != paperPhaseCompetition {
 		t.Fatalf("expected competition phase, got %q", opt.DebugState().OptimizerPhase)
 	}
+	if delta := rate - 0.15; delta < opt.tuning.CompetitionCutStepMax-1e-9 || delta > opt.tuning.CompetitionRecoveryStepMax+1e-9 {
+		t.Fatalf("expected competition move %.6f to stay within tuning bounds [%f, %f]", delta, opt.tuning.CompetitionCutStepMax, opt.tuning.CompetitionRecoveryStepMax)
+	}
 }
 
 func TestPaperMonopolyCompetitionRecognizesValidatedFeeCut(t *testing.T) {
@@ -107,6 +110,9 @@ func TestPaperMonopolyCompetitionRecognizesValidatedFeeCut(t *testing.T) {
 	if rate2 < rate1-1e-9 {
 		t.Fatalf("expected validated cut to stop pushing fee down, got %f -> %f", rate1, rate2)
 	}
+	if delta := rate2 - rate1; delta > opt.tuning.CompetitionRecoveryStepMax+1e-9 {
+		t.Fatalf("expected rebound step %.6f to stay within recovery max %f", delta, opt.tuning.CompetitionRecoveryStepMax)
+	}
 }
 
 func TestPaperMonopolyDominanceUsesRaiseCooldown(t *testing.T) {
@@ -137,11 +143,14 @@ func TestPaperMonopolyDominanceUsesRaiseCooldown(t *testing.T) {
 	if opt.DebugState().OptimizerPhase != paperPhaseDominance {
 		t.Fatalf("expected dominance phase, got %q", opt.DebugState().OptimizerPhase)
 	}
-	if rate1 <= 0.15 {
-		t.Fatalf("expected dominance phase to raise fee, got %f", rate1)
+	if rate1 <= 0.154 {
+		t.Fatalf("expected dominance phase to raise fee by more than the old +0.004 pattern, got %f", rate1)
 	}
 	if math.Abs(rate2-rate1) > 1e-9 {
 		t.Fatalf("expected cooldown to prevent consecutive raises, got %f then %f", rate1, rate2)
+	}
+	if delta := rate1 - 0.15; delta > opt.tuning.DominanceRaiseStepMax+1e-9 {
+		t.Fatalf("expected dominance raise step %.6f to stay within tuning max %f", delta, opt.tuning.DominanceRaiseStepMax)
 	}
 }
 
@@ -253,5 +262,12 @@ func TestPaperMonopolyMemoryPhaseCapsUpperBound(t *testing.T) {
 	}
 	if rate > debug.DynamicUpperBound+1e-9 {
 		t.Fatalf("expected fee to stay under capped upper bound, got rate %f > %f", rate, debug.DynamicUpperBound)
+	}
+	lowerBound, upperBound := opt.memoryBandBounds()
+	if upperBound-lowerBound < opt.tuning.MemoryBandMinWidth-1e-9 {
+		t.Fatalf("expected memory band width to be at least %f, got [%f, %f]", opt.tuning.MemoryBandMinWidth, lowerBound, upperBound)
+	}
+	if rate < lowerBound-1e-9 || rate > upperBound+1e-9 {
+		t.Fatalf("expected memory rate %f to remain within computed band [%f, %f]", rate, lowerBound, upperBound)
 	}
 }

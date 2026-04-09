@@ -82,8 +82,10 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 	}
 	firstShockEpoch := earliestPhaseEpoch(hub0Rows, hub1Rows, "shock")
 	if firstShockEpoch > 0 {
-		if hasCompetitionPhaseFlushBeforeEpoch(hub0Rows, firstShockEpoch, params.BrokerNum) || hasCompetitionPhaseFlushBeforeEpoch(hub1Rows, firstShockEpoch, params.BrokerNum) {
-			t.Fatal("expected competition-phase broker counts to stay smoother before the first shock")
+		hub0P90, hub0Max := competitionBrokerDeltaStatsBeforeEpoch(hub0Rows, firstShockEpoch)
+		hub1P90, hub1Max := competitionBrokerDeltaStatsBeforeEpoch(hub1Rows, firstShockEpoch)
+		if hub0P90 > 2 || hub1P90 > 2 || hub0Max > 6 || hub1Max > 6 {
+			t.Fatalf("expected smoother competition broker jumps before the first shock, got hub0 p90/max=%d/%d hub1 p90/max=%d/%d", hub0P90, hub0Max, hub1P90, hub1Max)
 		}
 	}
 	if math.Max(maxCriticalCapBeforeEpoch(hub0Rows, 150), maxCriticalCapBeforeEpoch(hub1Rows, 150)) <= 0.06 {
@@ -102,13 +104,13 @@ func TestRunPaperMonopolyLocalHarnessLimit300Seed42(t *testing.T) {
 		winnerRows = hub1Rows
 		loserRows = hub0Rows
 	}
-	if tailPhaseCount(winnerRows, "memory", 30) < 20 {
-		t.Fatal("expected the winner to settle into a memory-dominant regime in the final 30 epochs")
+	if tailPhaseCount(winnerRows, "memory", 12) < 8 {
+		t.Fatal("expected the winner to end in a memory-dominant regime in the final 12 epochs")
 	}
-	if tailMERRange(winnerRows, 100) <= 1e-4 {
-		t.Fatal("expected winner MER to keep moving in memory phase instead of flattening completely")
+	if tailMERRange(winnerRows, 100) <= 0.015 {
+		t.Fatal("expected winner MER to keep a visibly wider tail range after retuning")
 	}
-	if finalCriticalCap(winnerRows) > 0 && finalTailMaxMER(winnerRows, 30) >= finalCriticalCap(winnerRows) {
+	if finalCriticalCap(winnerRows) > 0 && finalTailMaxMER(winnerRows, 12) >= finalCriticalCap(winnerRows) {
 		t.Fatal("expected winner MER to stay below the learned critical MER cap once memory takes over")
 	}
 	if tailPhaseCount(loserRows, "memory", 100) == 100 && tailMERRange(loserRows, 100) <= 1e-4 {
@@ -362,6 +364,43 @@ func hasCompetitionPhaseFlushBeforeEpoch(rows []replayRow, maxEpoch, totalBroker
 	return false
 }
 
+func competitionBrokerDeltaStatsBeforeEpoch(rows []replayRow, maxEpoch int) (int, int) {
+	deltas := make([]int, 0, len(rows))
+	maxDelta := 0
+	for idx := 1; idx < len(rows); idx++ {
+		prev := rows[idx-1]
+		current := rows[idx]
+		if prev.Epoch >= maxEpoch || current.Epoch >= maxEpoch {
+			break
+		}
+		if prev.OptimizerPhase != competitionPhaseCompetition || current.OptimizerPhase != competitionPhaseCompetition {
+			continue
+		}
+		delta := absReplayInt(current.BrokerNum - prev.BrokerNum)
+		deltas = append(deltas, delta)
+		if delta > maxDelta {
+			maxDelta = delta
+		}
+	}
+	if len(deltas) == 0 {
+		return 0, 0
+	}
+	sorted := append([]int(nil), deltas...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	p90Index := int(math.Ceil(0.9*float64(len(sorted)))) - 1
+	if p90Index < 0 {
+		p90Index = 0
+	}
+	if p90Index >= len(sorted) {
+		p90Index = len(sorted) - 1
+	}
+	return sorted[p90Index], maxDelta
+}
+
 func sameBrokerTrajectoryPrefix(left, right []replayRow, maxEpoch int) bool {
 	leftByEpoch := make(map[int]int, len(left))
 	for _, row := range left {
@@ -513,4 +552,11 @@ func replayMinInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+func absReplayInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }

@@ -10,9 +10,39 @@ const (
 
 	paperWarmupBrokerThreshold        = 2
 	paperWarmupParticipationThreshold = 0.1
-	paperDominanceBrokerThreshold     = 4
+	paperDominanceBrokerThreshold     = 2
 	paperShockBrokerFloor             = 5
 )
+
+type paperMonopolyTuning struct {
+	CompetitionCutStepBase     float64
+	CompetitionCutStepMax      float64
+	CompetitionRecoveryStepMax float64
+	DominanceRaiseStepBase     float64
+	DominanceRaiseStepMax      float64
+	DominancePullbackStep      float64
+	MemoryStepUpMax            float64
+	MemoryStepDownMax          float64
+	MemoryBandMinWidth         float64
+	MemoryUpperCapRatio        float64
+	MemoryLowerCapRatio        float64
+}
+
+func defaultPaperMonopolyTuning() paperMonopolyTuning {
+	return paperMonopolyTuning{
+		CompetitionCutStepBase:     -0.0035,
+		CompetitionCutStepMax:      -0.0120,
+		CompetitionRecoveryStepMax: 0.0035,
+		DominanceRaiseStepBase:     0.0035,
+		DominanceRaiseStepMax:      0.0075,
+		DominancePullbackStep:      -0.0040,
+		MemoryStepUpMax:            0.0040,
+		MemoryStepDownMax:          -0.0055,
+		MemoryBandMinWidth:         0.0080,
+		MemoryUpperCapRatio:        0.95,
+		MemoryLowerCapRatio:        0.88,
+	}
+}
 
 type PaperMonopolyConfig struct {
 	InitialFunds                    float64
@@ -85,6 +115,7 @@ type PaperMonopolyOptimizer struct {
 	LastFeeCutRevenueBaseline float64
 	LastFeeCutFundsBaseline   float64
 	LastFeeCutValidated       bool
+	tuning                    paperMonopolyTuning
 }
 
 func DefaultPaperMonopolyConfig(initialFunds float64, seed int64) PaperMonopolyConfig {
@@ -194,6 +225,7 @@ func NewPaperMonopolyOptimizer(id string, cfg PaperMonopolyConfig) *PaperMonopol
 		CurrentPhase:                    paperPhaseCompetition,
 		LastFeeCutEpoch:                 -1,
 		LastRaiseEpoch:                  -100,
+		tuning:                          defaultPaperMonopolyTuning(),
 	}
 }
 
@@ -434,71 +466,72 @@ func (o *PaperMonopolyOptimizer) recentTrends() (float64, float64) {
 }
 
 func (o *PaperMonopolyOptimizer) competitionAdjustment(investedFunds, prevInvestedFunds, competitorInvestedFunds, fundShare, participationRate float64, brokerCount int, revenueSlope, fundsSlope float64) float64 {
+	tuning := o.tuning
 	investedFundsRatio := 1.0
 	if prevInvestedFunds > 0 {
 		investedFundsRatio = investedFunds / math.Max(prevInvestedFunds, 1)
 	}
+	warmupActive := brokerCount < paperWarmupBrokerThreshold && participationRate < paperWarmupParticipationThreshold
+	cutFloor := tuning.CompetitionCutStepMax
+	if warmupActive {
+		cutFloor = math.Max(cutFloor, tuning.CompetitionCutStepBase)
+	}
 	if prevInvestedFunds > 0 && investedFundsRatio <= 0.2 &&
 		(o.EmergencyInvestedFundsThreshold < 0 || investedFunds <= o.EmergencyInvestedFundsThreshold) {
-		return -0.008
+		return cutFloor
 	}
-	warmupActive := brokerCount < paperWarmupBrokerThreshold && participationRate < paperWarmupParticipationThreshold
 
 	fundsGapRatio := (competitorInvestedFunds - investedFunds) / math.Max(competitorInvestedFunds+investedFunds, 1)
-	adjustment := -0.002
+	adjustment := tuning.CompetitionCutStepBase
 
 	if fundsGapRatio > 0.03 {
-		adjustment -= math.Min(0.006, 0.02*fundsGapRatio+0.002)
+		adjustment -= math.Min(math.Abs(cutFloor-tuning.CompetitionCutStepBase), 0.025*fundsGapRatio+0.003)
 	}
 	if participationRate < 0.45 {
-		adjustment -= 0.0015
+		adjustment -= 0.0020
 	}
 	if revenueSlope < 0 {
-		adjustment -= 0.002
+		adjustment -= 0.0025
 	}
 	if fundsSlope < 0 {
-		adjustment -= 0.002
+		adjustment -= 0.0025
 	}
 	if o.LastFeeCutValidated {
 		if revenueSlope >= 0 && fundsSlope >= 0 {
-			return clamp(math.Max(adjustment, 0.001), -0.002, 0.002)
+			return clamp(tuning.CompetitionRecoveryStepMax*0.6, cutFloor, tuning.CompetitionRecoveryStepMax)
 		}
-		adjustment += 0.003
+		adjustment += 0.004
 	}
 	if revenueSlope > 0 && fundsSlope > 0 && fundShare > 0.62 {
-		adjustment += 0.0015
+		adjustment += tuning.CompetitionRecoveryStepMax * 0.5
 	}
 	if fundsGapRatio < -0.08 && revenueSlope > 0 && fundsSlope > 0 {
-		adjustment += 0.001
+		adjustment += tuning.CompetitionRecoveryStepMax * 0.35
 	}
-
-	minAdjustment := -0.008
-	if warmupActive {
-		minAdjustment = -0.004
-	}
-	return clamp(adjustment, minAdjustment, 0.002)
+	return clamp(adjustment, cutFloor, tuning.CompetitionRecoveryStepMax)
 }
 
 func (o *PaperMonopolyOptimizer) dominanceAdjustment(iteration int, investedFunds, competitorInvestedFunds, fundShare, revenueSlope, fundsSlope float64) float64 {
+	tuning := o.tuning
 	if iteration <= o.LastRaiseEpoch+1 {
 		if revenueSlope < 0 || fundsSlope < 0 {
-			return -0.003
+			return tuning.DominancePullbackStep
 		}
 		return 0
 	}
 
 	if revenueSlope < 0 || fundsSlope < 0 {
-		return -0.003
+		return tuning.DominancePullbackStep
 	}
 
 	leadRatio := math.Max(0, (investedFunds-competitorInvestedFunds)/math.Max(investedFunds+competitorInvestedFunds, 1))
-	adjustment := 0.002
+	adjustment := tuning.DominanceRaiseStepBase
 	if leadRatio > 0.1 || fundShare > 0.9 {
-		adjustment = 0.004
+		adjustment = tuning.DominanceRaiseStepMax
 	} else if leadRatio < 0.03 {
-		adjustment = 0.0015
+		adjustment = tuning.DominanceRaiseStepBase * 0.6
 	}
-	return clamp(adjustment, -0.003, 0.004)
+	return clamp(adjustment, tuning.DominancePullbackStep, tuning.DominanceRaiseStepMax)
 }
 
 func (o *PaperMonopolyOptimizer) memoryAdjustment(fundShare, revenueSlope, fundsSlope float64) float64 {
@@ -506,21 +539,35 @@ func (o *PaperMonopolyOptimizer) memoryAdjustment(fundShare, revenueSlope, funds
 		return 0
 	}
 
-	upperMemoryBound := math.Min(o.CriticalMERCap*0.95, o.CriticalMERCap-0.001)
-	lowerMemoryBound := math.Max(o.MinFeeRate, math.Min(o.CriticalMERCap*0.9, upperMemoryBound-0.003))
-	if upperMemoryBound-lowerMemoryBound < 0.003 {
-		lowerMemoryBound = math.Max(o.MinFeeRate, upperMemoryBound-0.003)
-	}
+	lowerMemoryBound, upperMemoryBound := o.memoryBandBounds()
 
 	anchor := lowerMemoryBound + 0.5*(upperMemoryBound-lowerMemoryBound)
 	if fundShare > 0.92 && revenueSlope >= 0 && fundsSlope >= 0 {
-		anchor = upperMemoryBound - 0.0005
+		anchor = upperMemoryBound - 0.001
 	}
 	if revenueSlope < 0 || fundsSlope < 0 {
 		anchor = lowerMemoryBound
 	}
 	anchor = clamp(anchor, lowerMemoryBound, upperMemoryBound)
-	return clamp(anchor-o.CurrentFeeRate, -0.0035, 0.0025)
+	return clamp(anchor-o.CurrentFeeRate, o.tuning.MemoryStepDownMax, o.tuning.MemoryStepUpMax)
+}
+
+func (o *PaperMonopolyOptimizer) memoryBandBounds() (float64, float64) {
+	upperMemoryBound := math.Min(o.CriticalMERCap*o.tuning.MemoryUpperCapRatio, o.CriticalMERCap-0.001)
+	lowerMemoryBound := math.Max(
+		o.MinFeeRate,
+		math.Min(
+			o.CriticalMERCap*o.tuning.MemoryLowerCapRatio,
+			upperMemoryBound-o.tuning.MemoryBandMinWidth,
+		),
+	)
+	if upperMemoryBound-lowerMemoryBound < o.tuning.MemoryBandMinWidth {
+		lowerMemoryBound = math.Max(o.MinFeeRate, upperMemoryBound-o.tuning.MemoryBandMinWidth)
+	}
+	if lowerMemoryBound > upperMemoryBound {
+		lowerMemoryBound = upperMemoryBound
+	}
+	return lowerMemoryBound, upperMemoryBound
 }
 
 func (o *PaperMonopolyOptimizer) capAwareUpperBound(iteration int) float64 {
@@ -530,7 +577,7 @@ func (o *PaperMonopolyOptimizer) capAwareUpperBound(iteration int) float64 {
 		o.MaxFeeRate,
 	)
 	if o.HasCriticalMERCap {
-		upperBound = math.Min(upperBound, 0.95*o.CriticalMERCap)
+		upperBound = math.Min(upperBound, o.tuning.MemoryUpperCapRatio*o.CriticalMERCap)
 	}
 	return clamp(upperBound, o.MinFeeRate, o.MaxFeeRate)
 }

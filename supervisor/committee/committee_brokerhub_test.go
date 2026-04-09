@@ -470,6 +470,7 @@ func newTestBrokerhubCommittee(brokerID string) *BrokerhubCommitteeMod {
 		hubObservedFeeHistory:  make(map[string][]float64),
 		feeOptimizerMode:       params.FeeOptimizerModeTaxRate,
 		rng:                    rand.New(rand.NewSource(1)),
+		competitionTuning:      defaultCompetitionDecisionTuning(),
 		sl: &supervisor_log.SupervisorLog{
 			Slog: log.New(io.Discard, "", 0),
 		},
@@ -556,7 +557,7 @@ func TestBrokerBehaviourSimulatorCompetitionJoinNeedsConfirmation(t *testing.T) 
 
 	bcm.broker_behaviour_simulator(true)
 	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
-		t.Fatal("expected broker to stay in B2E until the competition signal is confirmed twice")
+		t.Fatal("expected broker to stay in B2E until the competition signal is confirmed three times")
 	}
 	state := bcm.brokerCompetitionState[brokerID]
 	if state == nil || state.PendingTarget != hubID || state.PendingMode != competitionPendingModeHub || state.ConsecutiveEpochs != 1 {
@@ -568,9 +569,17 @@ func TestBrokerBehaviourSimulatorCompetitionJoinNeedsConfirmation(t *testing.T) 
 	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(120)
 	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(10)
 	bcm.broker_behaviour_simulator(true)
+	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
+		t.Fatal("expected broker to remain in B2E after only two confirmations")
+	}
 
+	bcm.hubParams.currentEpoch = 5
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(120)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(120)
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(10)
+	bcm.broker_behaviour_simulator(true)
 	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
-		t.Fatalf("expected broker to join hub %s after the second confirmation, got %q", hubID, joinedHub)
+		t.Fatalf("expected broker to join hub %s after the third confirmation, got %q", hubID, joinedHub)
 	}
 }
 
@@ -606,7 +615,7 @@ func TestBrokerBehaviourSimulatorCompetitionExitNeedsConfirmation(t *testing.T) 
 
 	bcm.broker_behaviour_simulator(true)
 	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
-		t.Fatalf("expected broker to remain in hub %s until a second negative epoch confirms exit, got %q", hubID, joinedHub)
+		t.Fatalf("expected broker to remain in hub %s until three negative epochs confirm exit, got %q", hubID, joinedHub)
 	}
 	state := bcm.brokerCompetitionState[brokerID]
 	if state == nil || state.PendingTarget != competitionPendingModeB2E || state.PendingMode != competitionPendingModeB2E || state.ConsecutiveEpochs != 1 {
@@ -618,9 +627,17 @@ func TestBrokerBehaviourSimulatorCompetitionExitNeedsConfirmation(t *testing.T) 
 	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
 	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(25)
 	bcm.broker_behaviour_simulator(true)
+	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != hubID {
+		t.Fatalf("expected broker to remain in hub %s after only two confirmations, got %q", hubID, joinedHub)
+	}
 
+	bcm.hubParams.currentEpoch = 5
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(25)
+	bcm.broker_behaviour_simulator(true)
 	if _, ok := bcm.brokerJoinBrokerHubState[brokerID]; ok {
-		t.Fatal("expected broker to exit to B2E after two consecutive negative competition epochs")
+		t.Fatal("expected broker to exit to B2E after three consecutive negative competition epochs")
 	}
 }
 
@@ -683,10 +700,10 @@ func TestBrokerBehaviourSimulatorCompetitionLetsSmallerBrokersMoveFirst(t *testi
 		},
 	}
 	bcm.hubParams.currentEpoch = 3
-	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(10)
-	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(10)
-	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.8)
-	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(2.42)
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.0)
+	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(6.0)
 
 	cleanup := prepareSimulationWorkspace(t)
 	defer cleanup()
@@ -694,19 +711,28 @@ func TestBrokerBehaviourSimulatorCompetitionLetsSmallerBrokersMoveFirst(t *testi
 
 	bcm.broker_behaviour_simulator(true)
 	if _, ok := bcm.brokerJoinBrokerHubState[smallBrokerID]; ok {
-		t.Fatal("expected smaller broker to wait for a second confirmation before joining")
+		t.Fatal("expected smaller broker to wait for a third confirmation before joining")
 	}
 	if _, ok := bcm.brokerJoinBrokerHubState[largeBrokerID]; ok {
 		t.Fatal("expected larger broker to remain in B2E after the first epoch")
 	}
 
 	bcm.hubParams.currentEpoch = 4
-	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(10)
-	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(10)
-	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.8)
-	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(2.42)
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.0)
+	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(6.0)
 	bcm.broker_behaviour_simulator(true)
+	if _, ok := bcm.brokerJoinBrokerHubState[smallBrokerID]; ok {
+		t.Fatal("expected smaller broker to remain in B2E after only two confirmations")
+	}
 
+	bcm.hubParams.currentEpoch = 5
+	bcm.brokerhubEpochProfit[hubID] = big.NewFloat(30)
+	bcm.brokerhubEpochGrossRevenue[hubID] = big.NewFloat(30)
+	bcm.brokerEpochProfitInB2E[smallBrokerID] = big.NewFloat(0.0)
+	bcm.brokerEpochProfitInB2E[largeBrokerID] = big.NewFloat(6.0)
+	bcm.broker_behaviour_simulator(true)
 	if joinedHub := bcm.brokerJoinBrokerHubState[smallBrokerID]; joinedHub != hubID {
 		t.Fatalf("expected smaller broker to join hub %s first, got %q", hubID, joinedHub)
 	}
@@ -755,6 +781,59 @@ func TestEstimateHubUtilityCompetitionFeeCutBoostsAttraction(t *testing.T) {
 	baseUtility := bcm.estimateHubUtility(brokerID, challengerHubID, directUtility)
 	if boostedUtility <= baseUtility {
 		t.Fatalf("expected recent competition fee cut to raise utility, got boosted %.6f <= base %.6f", boostedUtility, baseUtility)
+	}
+	if boostedUtility/baseUtility > bcm.competitionTuning.AttractionBoostCap+1e-9 {
+		t.Fatalf("expected attraction boost ratio to stay under cap %f, got %.6f -> %.6f", bcm.competitionTuning.AttractionBoostCap, baseUtility, boostedUtility)
+	}
+}
+
+func TestBrokerBehaviourSimulatorCompetitionRetentionPreventsMildJump(t *testing.T) {
+	brokerID := strings.Repeat("b", 40)
+	currentHubID := strings.Repeat("a", 40)
+	challengerHubID := strings.Repeat("c", 40)
+	bcm := newTestBrokerhubCommittee(brokerID)
+	bcm.BrokerHubAccountList = []utils.Address{currentHubID, challengerHubID}
+	bcm.Broker.BrokerAddress = []utils.Address{brokerID, currentHubID, challengerHubID}
+	bcm.Broker.BrokerBalance[brokerID] = shardBalances(100)
+	bcm.Broker.BrokerBalance[currentHubID] = shardBalances(300)
+	bcm.Broker.BrokerBalance[challengerHubID] = shardBalances(320)
+	bcm.Broker.LockBalance[challengerHubID] = shardBalances(0)
+	bcm.Broker.ProfitBalance[challengerHubID] = shardProfitBalances()
+	bcm.brokerInfoListInBrokerHub[currentHubID] = []*message.BrokerInfoInBrokerhub{}
+	bcm.brokerInfoListInBrokerHub[challengerHubID] = []*message.BrokerInfoInBrokerhub{}
+	bcm.brokerhubEpochGrossRevenue[currentHubID] = big.NewFloat(100)
+	bcm.brokerhubEpochGrossRevenue[challengerHubID] = big.NewFloat(100)
+	bcm.feeOptimizers = map[string]optimizerPkg.FeeOptimizer{
+		currentHubID: &staticFeeOptimizer{
+			fee:   0.10,
+			debug: optimizerPkg.FeeOptimizerDebug{OptimizerPhase: competitionPhaseCompetition},
+		},
+		challengerHubID: &staticFeeOptimizer{
+			fee:   0.09,
+			debug: optimizerPkg.FeeOptimizerDebug{OptimizerPhase: competitionPhaseCompetition},
+		},
+	}
+	if res := bcm.JoiningToBrokerhub(brokerID, currentHubID); res != "done" {
+		t.Fatalf("expected initial join to succeed, got %q", res)
+	}
+	bcm.brokerB2EProfitHistory[brokerID] = []float64{5, 5, 5}
+	bcm.brokerEpochProfitInB2E[brokerID] = big.NewFloat(5)
+
+	cleanup := prepareSimulationWorkspace(t)
+	defer cleanup()
+	bcm.writeDataToCsv(true, 0)
+
+	for epoch := 3; epoch <= 5; epoch++ {
+		bcm.hubParams.currentEpoch = epoch
+		bcm.brokerhubEpochProfit[currentHubID] = big.NewFloat(100)
+		bcm.brokerhubEpochGrossRevenue[currentHubID] = big.NewFloat(100)
+		bcm.brokerhubEpochProfit[challengerHubID] = big.NewFloat(100)
+		bcm.brokerhubEpochGrossRevenue[challengerHubID] = big.NewFloat(100)
+		bcm.broker_behaviour_simulator(true)
+	}
+
+	if joinedHub := bcm.brokerJoinBrokerHubState[brokerID]; joinedHub != currentHubID {
+		t.Fatalf("expected incumbent retention margin to keep broker in hub %s, got %q", currentHubID, joinedHub)
 	}
 }
 
